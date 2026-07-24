@@ -1,0 +1,86 @@
+{
+  "num_nodes": 1,
+  "link_bw": 900,
+  "link_latency": 1000,
+  "nodes": [
+    {
+      "num_instances": 1,
+      "cpu_mem": {
+        "mem_size": 512,
+        "mem_bw": 256,
+        "mem_latency": 100
+      },
+      "instances": [
+        {
+          "model_name": "meta-llama/Llama-3.1-8B",
+          "hardware": "HBF_GPU_PLACEHOLDER",
+          "npu_mem": {
+            "mem_size": 96,
+            "mem_bw": 3000,
+            "mem_latency": 100
+          },
+          "hbf_mem": {
+            "mem_size": 512
+          },
+          "num_npus": 2,
+          "tp_size": 2,
+          "pp_size": 1,
+          "pd_type": null,
+          "dtype": "bfloat16",
+          "kv_cache_dtype": "auto",
+          "block_size": 16,
+          "max_num_seqs": 128,
+          "max_num_batched_tokens": 2048,
+          "enable_chunked_prefill": true,
+          "enable_prefix_caching": false,
+          "enable_local_offloading": false,
+          "enable_attn_offloading": false,
+          "enable_sub_batch_interleaving": false,
+          "placement": {
+            "default": {
+              "weights": "npu",
+              "kv_loc": "npu",
+              "kv_evict_loc": "cpu"
+            }
+          },
+          "performance_profile": {
+            "mode": "memory_scenario_v2",
+            "memory_profile_id": "replace-with-llmcompass-profile-id",
+            "scenario_selection": "residency_derived"
+          },
+          "memory_tiering": {
+            "weights": {
+              "policy": "static_map",
+              "default_tier": "hbm",
+              "layers": {
+                "lm_head": "hbf"
+              },
+              "blocks": [
+                {
+                  "blocks": "0-15",
+                  "tier": "hbf"
+                }
+              ]
+            },
+            "kv": {
+              "policy": "length_threshold",
+              "admission_tier": "hbm",
+              "threshold_tokens": 4096
+            },
+            "prefix": {
+              "policy": "hbm_only"
+            },
+            "transfer": {
+              "prefetch": "none",
+              "capacity_fallback": "reject"
+            },
+            "communication_buffers": {
+              "tier": "hbm",
+              "allow_hbf_staging": false
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
