@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
 
 from .memory_tiering import (
+    MemoryObjectKind,
     MemoryTier,
     ResidencySnapshot,
     TransferOperation,
@@ -46,23 +48,31 @@ class MemoryTieringStatsSnapshot:
         tuple[MemoryTier, MemoryTier],
         CountedBytes,
     ]
+    transfers_by_reason: Mapping[str, CountedBytes]
+    transfers_by_object_kind: Mapping[MemoryObjectKind, CountedBytes]
+    transfers_by_layer: Mapping[int | None, CountedBytes]
+    policy_actions: Mapping[str, int]
+    residency_batches: int
+    residency_hit_batches: int
+    attention_group_observations: int
+    attention_hbm_groups: int
+    attention_hbf_groups: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
+        for field in (
             "resident_high_water_bytes",
-            MappingProxyType(dict(self.resident_high_water_bytes)),
-        )
-        object.__setattr__(
-            self,
             "capacity_high_water_bytes",
-            MappingProxyType(dict(self.capacity_high_water_bytes)),
-        )
-        object.__setattr__(
-            self,
             "transfer_directions",
-            MappingProxyType(dict(self.transfer_directions)),
-        )
+            "transfers_by_reason",
+            "transfers_by_object_kind",
+            "transfers_by_layer",
+            "policy_actions",
+        ):
+            object.__setattr__(
+                self,
+                field,
+                MappingProxyType(dict(getattr(self, field))),
+            )
 
     def to_dict(self) -> dict:
         """转换为不含 Enum 键和 tuple 的 JSON 友好结构。"""
@@ -84,6 +94,29 @@ class MemoryTieringStatsSnapshot:
                     for (source, target), counter
                     in self.transfer_directions.items()
                 },
+                "by_reason": {
+                    reason: counter.to_dict()
+                    for reason, counter in self.transfers_by_reason.items()
+                },
+                "by_object_kind": {
+                    kind.value: counter.to_dict()
+                    for kind, counter in self.transfers_by_object_kind.items()
+                },
+                "by_layer": {
+                    "unscoped" if layer is None else str(layer): counter.to_dict()
+                    for layer, counter in self.transfers_by_layer.items()
+                },
+            },
+            "policy_actions": dict(self.policy_actions),
+            "residency_batches": {
+                "observed": self.residency_batches,
+                "hits": self.residency_hit_batches,
+                "misses": self.residency_batches - self.residency_hit_batches,
+            },
+            "attention_groups": {
+                "observations": self.attention_group_observations,
+                "hbm": self.attention_hbm_groups,
+                "hbf": self.attention_hbf_groups,
             },
         }
 
@@ -96,6 +129,26 @@ def _validate_rank_values(values, num_ranks, field):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{field} 必须只包含非负整数")
     return result
+
+
+def _positive_int(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} 必须是正整数")
+    return value
+
+
+def _nonnegative_int(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} 必须是非负整数")
+    return value
+
+
+def _name(value, field):
+    if isinstance(value, Enum):
+        value = value.value
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} 必须是非空字符串或字符串 Enum")
+    return value.strip()
 
 
 class MemoryTieringStats:
@@ -120,6 +173,24 @@ class MemoryTieringStats:
             tier: [0] * num_ranks for tier in _CAPACITY_TIERS
         }
         self._transfer_directions = {}
+        self._transfers_by_reason = {}
+        self._transfers_by_object_kind = {}
+        self._transfers_by_layer = {}
+        self._policy_actions = {}
+        self._residency_batches = 0
+        self._residency_hit_batches = 0
+        self._attention_group_observations = 0
+        self._attention_hbm_groups = 0
+        self._attention_hbf_groups = 0
+
+    def _increment_bytes(self, counters, key, sizes):
+        current = counters.get(key)
+        if current is None:
+            current = [0, [0] * self.num_ranks]
+            counters[key] = current
+        current[0] += 1
+        for rank, amount in enumerate(sizes):
+            current[1][rank] += amount
 
     def observe_residency(self, snapshot: ResidencySnapshot) -> None:
         """观察一次账本状态；容量高水位包含目标侧预留。"""
@@ -159,14 +230,64 @@ class MemoryTieringStats:
             self.num_ranks,
             "operation.bytes_per_rank",
         )
-        key = (operation.source, operation.target)
-        current = self._transfer_directions.get(key)
-        if current is None:
-            current = [0, [0] * self.num_ranks]
-            self._transfer_directions[key] = current
-        current[0] += 1
-        for rank, amount in enumerate(sizes):
-            current[1][rank] += amount
+        reason = _name(operation.reason, "operation.reason")
+        self._increment_bytes(
+            self._transfer_directions,
+            (operation.source, operation.target),
+            sizes,
+        )
+        self._increment_bytes(self._transfers_by_reason, reason, sizes)
+        self._increment_bytes(
+            self._transfers_by_object_kind,
+            operation.object_key.kind,
+            sizes,
+        )
+        self._increment_bytes(
+            self._transfers_by_layer,
+            operation.object_key.layer_index,
+            sizes,
+        )
+
+    def record_policy_action(self, action, *, count: int = 1) -> None:
+        """记录策略引擎的决定；KEEP 等动作不会伪造迁移流量。"""
+
+        normalized = _name(action, "action")
+        count = _positive_int(count, "count")
+        self._policy_actions[normalized] = (
+            self._policy_actions.get(normalized, 0) + count
+        )
+
+    def record_residency_batch(self, *, hit: bool) -> None:
+        """记录一个 batch 是否无需额外迁移即可满足目标驻留。"""
+
+        if not isinstance(hit, bool):
+            raise TypeError("hit 必须是 bool")
+        self._residency_batches += 1
+        if hit:
+            self._residency_hit_batches += 1
+
+    def record_attention_groups(
+        self,
+        *,
+        hbm_groups: int,
+        hbf_groups: int,
+    ) -> None:
+        """累计一次 Attention lookup 的真实驻留分组数。"""
+
+        hbm_groups = _nonnegative_int(hbm_groups, "hbm_groups")
+        hbf_groups = _nonnegative_int(hbf_groups, "hbf_groups")
+        self._attention_group_observations += 1
+        self._attention_hbm_groups += hbm_groups
+        self._attention_hbf_groups += hbf_groups
+
+    def _freeze_bytes(self, counters):
+        return {
+            key: CountedBytes(
+                operations=value[0],
+                bytes_per_rank=tuple(value[1]),
+            )
+            for key, value in counters.items()
+        }
 
     def snapshot(self) -> MemoryTieringStatsSnapshot:
         return MemoryTieringStatsSnapshot(
@@ -179,11 +300,22 @@ class MemoryTieringStats:
                 tier: tuple(values)
                 for tier, values in self._capacity_high_water.items()
             },
-            transfer_directions={
-                key: CountedBytes(
-                    operations=value[0],
-                    bytes_per_rank=tuple(value[1]),
-                )
-                for key, value in self._transfer_directions.items()
-            },
+            transfer_directions=self._freeze_bytes(
+                self._transfer_directions
+            ),
+            transfers_by_reason=self._freeze_bytes(
+                self._transfers_by_reason
+            ),
+            transfers_by_object_kind=self._freeze_bytes(
+                self._transfers_by_object_kind
+            ),
+            transfers_by_layer=self._freeze_bytes(
+                self._transfers_by_layer
+            ),
+            policy_actions=dict(self._policy_actions),
+            residency_batches=self._residency_batches,
+            residency_hit_batches=self._residency_hit_batches,
+            attention_group_observations=self._attention_group_observations,
+            attention_hbm_groups=self._attention_hbm_groups,
+            attention_hbf_groups=self._attention_hbf_groups,
         )

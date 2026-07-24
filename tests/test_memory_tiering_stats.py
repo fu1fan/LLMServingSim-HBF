@@ -6,6 +6,7 @@ from serving.core.memory_tiering import (
     MemoryObjectKind,
     MemoryTier,
     TieredResidencyManager,
+    TransferOperation,
 )
 from serving.core.memory_tiering_stats import MemoryTieringStats
 
@@ -83,12 +84,90 @@ class MemoryTieringStatsCapacityTest(unittest.TestCase):
             1,
         )
 
+    def test_explicit_transfers_are_broken_down_by_reason_kind_and_layer(self):
+        stats = MemoryTieringStats(num_ranks=2)
+        first = TransferOperation(
+            transfer_id=1,
+            object_key=MemoryObjectKey(
+                MemoryObjectKind.KV,
+                "request-1",
+                layer_index=3,
+            ),
+            source=MemoryTier.HBF,
+            target=MemoryTier.HBM,
+            bytes_per_rank=(10, 20),
+            reason="kv_promote",
+        )
+        second = TransferOperation(
+            transfer_id=2,
+            object_key=MemoryObjectKey(
+                MemoryObjectKind.KV,
+                "request-2",
+                layer_index=3,
+            ),
+            source=MemoryTier.HBF,
+            target=MemoryTier.HBM,
+            bytes_per_rank=(5, 8),
+            reason="kv_promote",
+        )
+        unscoped = TransferOperation(
+            transfer_id=3,
+            object_key=MemoryObjectKey(MemoryObjectKind.PREFIX, "prefix-1"),
+            source=MemoryTier.CXL,
+            target=MemoryTier.HBF,
+            bytes_per_rank=(4, 4),
+            reason="prefix_restore",
+        )
+        for operation in (first, second, unscoped):
+            stats.record_completed_transfer(operation)
+
+        snapshot = stats.snapshot()
+        promoted = snapshot.transfers_by_reason["kv_promote"]
+        self.assertEqual(promoted.operations, 2)
+        self.assertEqual(promoted.bytes_per_rank, (15, 28))
+        self.assertEqual(
+            snapshot.transfers_by_object_kind[MemoryObjectKind.KV].total_bytes,
+            43,
+        )
+        self.assertEqual(snapshot.transfers_by_layer[3].operations, 2)
+        self.assertEqual(snapshot.transfers_by_layer[None].operations, 1)
+
+    def test_records_policy_batch_hits_and_attention_residency_groups(self):
+        stats = MemoryTieringStats(num_ranks=1)
+        stats.record_policy_action("keep", count=2)
+        stats.record_policy_action("migrate")
+        stats.record_residency_batch(hit=True)
+        stats.record_residency_batch(hit=False)
+        stats.record_attention_groups(hbm_groups=1, hbf_groups=1)
+        stats.record_attention_groups(hbm_groups=0, hbf_groups=1)
+
+        snapshot = stats.snapshot()
+        self.assertEqual(snapshot.policy_actions, {"keep": 2, "migrate": 1})
+        self.assertEqual(snapshot.residency_batches, 2)
+        self.assertEqual(snapshot.residency_hit_batches, 1)
+        self.assertEqual(snapshot.attention_group_observations, 2)
+        self.assertEqual(snapshot.attention_hbm_groups, 1)
+        self.assertEqual(snapshot.attention_hbf_groups, 2)
+        payload = snapshot.to_dict()
+        self.assertEqual(payload["residency_batches"]["misses"], 1)
+        self.assertEqual(payload["attention_groups"]["hbf"], 2)
+
+    def test_non_transfer_signals_do_not_create_profile_demand_migrations(self):
+        stats = MemoryTieringStats(num_ranks=1)
+        stats.record_policy_action("keep")
+        stats.record_residency_batch(hit=True)
+        stats.record_attention_groups(hbm_groups=1, hbf_groups=1)
+
+        self.assertEqual(stats.snapshot().transfer_directions, {})
+
     def test_snapshot_is_immutable_and_json_friendly(self):
         stats = MemoryTieringStats(num_ranks=1)
         snapshot = stats.snapshot()
 
         with self.assertRaises(TypeError):
             snapshot.resident_high_water_bytes[MemoryTier.HBM] = (1,)
+        with self.assertRaises(TypeError):
+            snapshot.policy_actions["migrate"] = 1
         payload = snapshot.to_dict()
         self.assertEqual(payload["schema"], "llmservingsim_memory_tiering_stats_v1")
         json.dumps(payload)
