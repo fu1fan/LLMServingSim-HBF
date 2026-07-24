@@ -15,8 +15,15 @@ from .profile_contract import (
 
 LEGACY_HBM_ONLY = "legacy_hbm_only"
 MEMORY_SCENARIO_V2 = "memory_scenario_v2"
+STATIC_SCENARIO_POLICY = "static_policy"
+RESIDENCY_DERIVED = "residency_derived"
 
-_PROFILE_FIELDS = {"mode", "memory_profile_id", "scenario_policy"}
+_PROFILE_FIELDS = {
+    "mode",
+    "memory_profile_id",
+    "scenario_selection",
+    "scenario_policy",
+}
 _POLICY_FIELDS = {"default", "layers", "blocks"}
 _BLOCK_RULE_FIELDS = {"blocks", "scenario"}
 _CANONICAL_LAYER_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -37,6 +44,7 @@ class MemoryScenarioPolicy:
 
     mode: str
     memory_profile_id: str | None
+    scenario_selection: str | None
     default_scenario: str | None
     layer_scenarios: Mapping[str, str]
     block_scenarios: Mapping[int, str]
@@ -48,7 +56,14 @@ class MemoryScenarioPolicy:
 
     @property
     def requires_per_block_trace(self) -> bool:
-        return self.is_v2 and bool(self.block_scenarios)
+        return self.is_v2 and (
+            self.scenario_selection == RESIDENCY_DERIVED
+            or bool(self.block_scenarios)
+        )
+
+    @property
+    def is_residency_derived(self) -> bool:
+        return self.is_v2 and self.scenario_selection == RESIDENCY_DERIVED
 
     def scenario_for(
         self,
@@ -59,6 +74,10 @@ class MemoryScenarioPolicy:
 
         if not self.is_v2:
             return None
+        if self.is_residency_derived:
+            raise MemoryScenarioConfigError(
+                "residency_derived 必须由实际 BatchMemoryView 解析场景"
+            )
         _validate_layer_name(layer_name, field="layer_name")
         if block_index is not None:
             if isinstance(block_index, bool) or not isinstance(block_index, int):
@@ -162,6 +181,7 @@ def _legacy_policy(num_hidden_layers: int) -> MemoryScenarioPolicy:
     return MemoryScenarioPolicy(
         mode=LEGACY_HBM_ONLY,
         memory_profile_id=None,
+        scenario_selection=None,
         default_scenario=None,
         layer_scenarios=MappingProxyType({}),
         block_scenarios=MappingProxyType({}),
@@ -209,6 +229,33 @@ def parse_instance_performance_profile(
         raw.get("memory_profile_id"),
         field="instance.performance_profile.memory_profile_id",
     )
+    scenario_selection = raw.get(
+        "scenario_selection",
+        STATIC_SCENARIO_POLICY,
+    )
+    if scenario_selection not in {
+        STATIC_SCENARIO_POLICY,
+        RESIDENCY_DERIVED,
+    }:
+        raise MemoryScenarioConfigError(
+            "instance.performance_profile.scenario_selection 必须是 "
+            f"{STATIC_SCENARIO_POLICY!r} 或 {RESIDENCY_DERIVED!r}"
+        )
+    if scenario_selection == RESIDENCY_DERIVED:
+        if "scenario_policy" in raw:
+            raise MemoryScenarioConfigError(
+                "residency_derived 与调用方 scenario_policy 互斥"
+            )
+        return MemoryScenarioPolicy(
+            mode=MEMORY_SCENARIO_V2,
+            memory_profile_id=profile_id,
+            scenario_selection=RESIDENCY_DERIVED,
+            default_scenario=None,
+            layer_scenarios=MappingProxyType({}),
+            block_scenarios=MappingProxyType({}),
+            num_hidden_layers=num_layers,
+        )
+
     policy_raw = raw.get("scenario_policy")
     if not isinstance(policy_raw, Mapping):
         raise MemoryScenarioConfigError(
@@ -277,6 +324,7 @@ def parse_instance_performance_profile(
     return MemoryScenarioPolicy(
         mode=MEMORY_SCENARIO_V2,
         memory_profile_id=profile_id,
+        scenario_selection=STATIC_SCENARIO_POLICY,
         default_scenario=default_scenario,
         layer_scenarios=MappingProxyType(layer_scenarios),
         block_scenarios=MappingProxyType(block_scenarios),

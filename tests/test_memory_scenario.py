@@ -4,6 +4,8 @@ import unittest
 from serving.core.memory_scenario import (
     LEGACY_HBM_ONLY,
     MEMORY_SCENARIO_V2,
+    RESIDENCY_DERIVED,
+    STATIC_SCENARIO_POLICY,
     MemoryScenarioCompatibilityError,
     MemoryScenarioConfigError,
     parse_instance_performance_profile,
@@ -107,6 +109,10 @@ class MemoryScenarioPolicyTest(unittest.TestCase):
 
         self.assertTrue(policy.is_v2)
         self.assertEqual(policy.memory_profile_id, "cli-a")
+        self.assertEqual(
+            policy.scenario_selection,
+            STATIC_SCENARIO_POLICY,
+        )
         self.assertTrue(policy.requires_per_block_trace)
         self.assertEqual(policy.scenario_for("qkv_proj", 1), "qkv_hbf")
         self.assertEqual(policy.scenario_for("attention", 1), "early_hbf")
@@ -114,6 +120,41 @@ class MemoryScenarioPolicyTest(unittest.TestCase):
         self.assertEqual(policy.scenario_for("attention", 3), "all_hbm")
         self.assertEqual(policy.scenario_for("embedding", None), "embedding_hbf")
         self.assertEqual(policy.scenario_for("lm_head", None), "all_hbm")
+
+    def test_residency_derived_has_no_caller_scenario(self):
+        policy = parse_instance_performance_profile(
+            {
+                "performance_profile": {
+                    "mode": MEMORY_SCENARIO_V2,
+                    "memory_profile_id": "cli-a",
+                    "scenario_selection": RESIDENCY_DERIVED,
+                }
+            },
+            8,
+        )
+
+        self.assertTrue(policy.is_residency_derived)
+        self.assertTrue(policy.requires_per_block_trace)
+        self.assertIsNone(policy.default_scenario)
+        with self.assertRaisesRegex(
+            MemoryScenarioConfigError,
+            "BatchMemoryView",
+        ):
+            policy.scenario_for("attention", 0)
+
+    def test_residency_derived_rejects_manual_policy(self):
+        with self.assertRaisesRegex(MemoryScenarioConfigError, "互斥"):
+            parse_instance_performance_profile(
+                {
+                    "performance_profile": {
+                        "mode": MEMORY_SCENARIO_V2,
+                        "memory_profile_id": "cli-a",
+                        "scenario_selection": RESIDENCY_DERIVED,
+                        "scenario_policy": {"default": "all_hbm"},
+                    }
+                },
+                8,
+            )
 
     def test_layers_without_blocks_do_not_require_per_block_trace(self):
         policy = parse_instance_performance_profile(
