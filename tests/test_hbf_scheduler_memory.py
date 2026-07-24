@@ -73,7 +73,7 @@ def _memory(
     )
 
 
-def _scheduler(config=None, *, pd_type=None):
+def _scheduler(config=None, *, pd_type=None, prefix=False):
     return Scheduler(
         "test-model",
         0,
@@ -91,7 +91,7 @@ def _scheduler(config=None, *, pd_type=None):
         16,
         4,
         False,
-        False,
+        prefix,
         False,
         None,
         None,
@@ -355,19 +355,26 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         self.assertTrue(memory.is_avail(plan.growth_bytes_per_rank, Device.NPU))
 
     def test_tiered_capacity_pressure_rejects_legacy_cpu_preemption(self):
-        scheduler = _scheduler(_tiering(kv={"policy": "hbm_only"}))
-        scheduler.memory.npu_mem = scheduler.memory.npu_used
-        scheduler.add_request(
-            [13, "test-model", 16, 32, 0, 0],
-            is_init=False,
-        )
-        scheduler.request[0].num_computed_tokens = 16
+        for prefix in (False, True):
+            with self.subTest(prefix=prefix):
+                scheduler = _scheduler(
+                    _tiering(kv={"policy": "hbm_only"}),
+                    prefix=prefix,
+                )
+                scheduler.memory.npu_mem = scheduler.memory.npu_used
+                if prefix:
+                    scheduler.memory.npu_prefix_cache.capacity = 0
+                scheduler.add_request(
+                    [13, "test-model", 16, 32, 0, 0],
+                    is_init=False,
+                )
+                scheduler.request[0].num_computed_tokens = 16
 
-        with self.assertRaisesRegex(RuntimeError, "CPU/CXL 抢占"):
-            scheduler.schedule(0, 0)
+                with self.assertRaisesRegex(RuntimeError, "CPU/CXL 抢占"):
+                    scheduler.schedule(0, 0)
 
-        self.assertFalse(scheduler.request[0].evict)
-        self.assertEqual(scheduler.memory.cpu_used, 0)
+                self.assertFalse(scheduler.request[0].evict)
+                self.assertEqual(scheduler.memory.cpu_used, 0)
 
     def test_watermark_policy_fails_closed_without_runtime_engine(self):
         config = _tiering(kv={"policy": "watermark_lru"})

@@ -115,6 +115,13 @@ class Scheduler:
             kv_size = self.memory.get_evict_kv(req)
             self.memory.free(kv_size, Device.NPU)
 
+    def _reject_unmodeled_tiered_preemption(self):
+        if self.memory.tiering_enabled:
+            raise RuntimeError(
+                "HBF 分层模式容量不足；active KV 的 CPU/CXL 抢占"
+                "尚未建立四向显式迁移，拒绝使用旧 aggregate 路径"
+            )
+
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
         # first NPU to process new batch
@@ -259,11 +266,7 @@ class Scheduler:
                 # preempt request one by one until there is enough space
                 if len(gen_req) == 0:
                     return None
-                if self.memory.tiering_enabled:
-                    raise RuntimeError(
-                        "HBF 分层模式容量不足；active KV 的 CPU/CXL 抢占"
-                        "尚未建立四向显式迁移，拒绝使用旧 aggregate 路径"
-                    )
+                self._reject_unmodeled_tiered_preemption()
                 
                 # check already evicted request
                 if gen_req[-1].evict:
@@ -595,6 +598,7 @@ class Scheduler:
                             self.memory.erase_prefix_info(req)
                             req._prefix_locked = False
                     return None
+                self._reject_unmodeled_tiered_preemption()
                 
                 # Check already evicted request
                 if gen_req[-1].evict:
