@@ -35,6 +35,63 @@ variants for the same hardware × model live as siblings.
 profiled once at TP=1 and **replicated** into other TP folders by the
 writer.
 
+## Analytical HBM/HBF Profile v2
+
+LLMCompass runtime-ready profiles add one identity directory below
+the variant:
+
+```text
+profiler/perf/<HARDWARE>/<MODEL>/<variant>/<memory_profile_id>/
+├── meta.yaml
+└── tp<N>/
+    ├── dense.csv
+    ├── per_sequence.csv
+    └── attention.csv
+```
+
+Each v2 CSV adds a discrete `memory_scenario` key and four physical
+traffic audit columns:
+
+```text
+hbm_read_bytes,hbm_write_bytes,hbf_read_bytes,hbf_write_bytes
+```
+
+The latency already includes compute and demand accesses to both
+memory tiers. Migration, prefetch, eviction, and network collectives
+remain excluded so the serving simulator can model those operations
+without charging demand traffic twice.
+
+A runtime-ready v2 manifest is accepted only when all of these
+producer claims are present and internally consistent:
+
+- `bundle_readiness: runtime_ready`,
+  `runtime_compatible: true`, and
+  `scenario_binding: producer_verified_v1`;
+- a passing `llmcompass_hbm_calibration_v1` calibration;
+- `performance_basis` marking HBM as `measured_calibrated` and HBF
+  as `parameterized_projection`;
+- `memory_integration.mode` set to `cli` or `csi`;
+- complete architecture, TP, scenario, engine, and attention-grid
+  requirements;
+- a canonical SHA-256 performance identity.
+
+New LLMCompass bundles also include `access_catalog`. It maps each
+stable `operator_id/access_id` to `semantic`, `access_type`, and
+`lifetime`, is mirrored inside the performance identity, and must be
+fully covered by every strict scenario. Older static v2 bundles may
+omit this catalog; residency-derived policies require the new form.
+
+The loader retains the four audit directions through the same
+interpolation path as latency. Existing `_lookup_*` functions still
+return integer nanoseconds, while the corresponding
+`_lookup_*_sample` functions return `ProfileLatencySample` with both
+latency and interpolated traffic.
+
+Profile v1 keeps its existing warning and extrapolation behavior.
+Profile v2 instead rejects runtime batch limits above the verified
+engine bounds, a mismatched KV block size, or an Attention query
+beyond `attention_grid.max_kv`.
+
 ## Times are microseconds
 
 All `time_us` columns are in **microseconds**. The simulator
@@ -260,12 +317,13 @@ skew_fit:
 The simulator reads:
 
 - `engine_effective`: to warn when runtime values exceed profiled
-  bounds (lookups will extrapolate).
+  bounds for v1; runtime-ready v2 treats the same mismatch as an
+  error.
 - `skew_fit.bucket_axes`: to build the bucket key at run time.
 - `skew_fit.per_tp[tp].alpha_default`: fallback when a request's
   bucket isn't in `skew_fit.csv`.
-- `attention_grid` and `skew_profile` are informational (not
-  consumed by the simulator).
+- `attention_grid` is informational for v1 and a hard query boundary
+  for runtime-ready v2. `skew_profile` remains informational.
 
 Full bucket → α mapping lives in `tp<N>/skew_fit.csv`. The simulator
 hydrates the CSV into an in-memory `alpha_by_bucket` map on first
