@@ -259,6 +259,11 @@ class Scheduler:
                 # preempt request one by one until there is enough space
                 if len(gen_req) == 0:
                     return None
+                if self.memory.tiering_enabled:
+                    raise RuntimeError(
+                        "HBF 分层模式容量不足；active KV 的 CPU/CXL 抢占"
+                        "尚未建立四向显式迁移，拒绝使用旧 aggregate 路径"
+                    )
                 
                 # check already evicted request
                 if gen_req[-1].evict:

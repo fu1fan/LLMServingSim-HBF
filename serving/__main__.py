@@ -200,6 +200,60 @@ def _resolve_instance_dtype(instance, cli_dtype, dtype_to_bits):
     return dtype
 
 
+def _validate_runtime_tiering_support(
+    memory_tiering,
+    instance,
+    *,
+    enable_prefix_caching,
+    num_hidden_layers,
+):
+    """拒绝只有策略接口、尚未进入 Serving 主循环的配置。"""
+
+    if not memory_tiering.enabled:
+        return
+    if memory_tiering.weights.policy not in {
+        "hbm_only",
+        "hbf_only",
+        "static_map",
+    }:
+        raise RuntimeError("当前主循环尚未驱动自适应 HBF 权重缓存")
+    if memory_tiering.kv.policy not in {
+        "hbm_only",
+        "hbf_only",
+        "length_threshold",
+    }:
+        raise RuntimeError("当前主循环尚未驱动 watermark_lru KV 策略")
+    if memory_tiering.prefix.policy != "hbm_only":
+        raise RuntimeError("当前 RadixCache 只支持 hbm_only Prefix 策略")
+    if (
+        memory_tiering.transfer.prefetch != "none"
+        or memory_tiering.transfer.capacity_fallback != "reject"
+    ):
+        raise RuntimeError(
+            "当前主循环只支持 prefetch=none 与 capacity_fallback=reject"
+        )
+    buffers = memory_tiering.communication_buffers
+    if buffers.tier.value != "hbm" or buffers.allow_hbf_staging:
+        raise RuntimeError("当前 collective 只支持 HBM communication buffers")
+
+    pp_size = instance.get("pp_size", 1)
+    if (
+        enable_prefix_caching
+        and num_hidden_layers % pp_size != 0
+    ):
+        raise RuntimeError(
+            "HBF Prefix 分账要求 num_hidden_layers 能整除 pp_size"
+        )
+    if (
+        instance.get("pd_type") in {"prefill", "decode"}
+        and memory_tiering.kv.policy != "hbm_only"
+    ):
+        raise RuntimeError(
+            "P/D 分离尚未实现 tier-aware 跨实例 KV 交接；"
+            "当前只允许 kv.policy=hbm_only"
+        )
+
+
 def _build_instance_runtime_configs(
     instances,
     args,
@@ -243,6 +297,16 @@ def _build_instance_runtime_configs(
             instance,
             model_config["num_hidden_layers"],
         )
+        enable_prefix_caching = instance.get(
+            "enable_prefix_caching",
+            args.enable_prefix_caching,
+        )
+        _validate_runtime_tiering_support(
+            memory_tiering,
+            instance,
+            enable_prefix_caching=enable_prefix_caching,
+            num_hidden_layers=model_config["num_hidden_layers"],
+        )
         normalized_placement = None
         if placements is not None:
             normalized_placement = placements[instance_id]
@@ -266,8 +330,7 @@ def _build_instance_runtime_configs(
             "kv_cache_dtype": kv_cache_dtype,
             "enable_chunked_prefill": instance.get(
                 "enable_chunked_prefill", args.enable_chunked_prefill),
-            "enable_prefix_caching": instance.get(
-                "enable_prefix_caching", args.enable_prefix_caching),
+            "enable_prefix_caching": enable_prefix_caching,
             "prioritize_prefill": instance.get("prioritize_prefill", args.prioritize_prefill),
             "enable_local_offloading": enable_local_offloading,
             "enable_attn_offloading": enable_attn_offloading,

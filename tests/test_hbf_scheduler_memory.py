@@ -354,6 +354,21 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         self.assertFalse(memory.is_kv_plan_avail(plan))
         self.assertTrue(memory.is_avail(plan.growth_bytes_per_rank, Device.NPU))
 
+    def test_tiered_capacity_pressure_rejects_legacy_cpu_preemption(self):
+        scheduler = _scheduler(_tiering(kv={"policy": "hbm_only"}))
+        scheduler.memory.npu_mem = scheduler.memory.npu_used
+        scheduler.add_request(
+            [13, "test-model", 16, 32, 0, 0],
+            is_init=False,
+        )
+        scheduler.request[0].num_computed_tokens = 16
+
+        with self.assertRaisesRegex(RuntimeError, "CPU/CXL 抢占"):
+            scheduler.schedule(0, 0)
+
+        self.assertFalse(scheduler.request[0].evict)
+        self.assertEqual(scheduler.memory.cpu_used, 0)
+
     def test_watermark_policy_fails_closed_without_runtime_engine(self):
         config = _tiering(kv={"policy": "watermark_lru"})
         req = Request(4, "test-model", 16, 32, 0, 0)

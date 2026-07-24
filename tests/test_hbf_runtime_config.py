@@ -158,6 +158,80 @@ class HbfRuntimeConfigTest(unittest.TestCase):
                 placements=[_placement(), _placement()],
             )
 
+    @patch.object(
+        serving_main,
+        "get_config",
+        return_value={
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 32,
+        },
+    )
+    def test_runtime_rejects_policy_interfaces_not_in_main_loop(self, _):
+        cases = (
+            (
+                {"weights": {"policy": "hbf_backed_hbm_cache"}},
+                "自适应 HBF 权重",
+            ),
+            (
+                {"kv": {"policy": "watermark_lru"}},
+                "watermark_lru",
+            ),
+            (
+                {"transfer": {"capacity_fallback": "cpu"}},
+                "capacity_fallback=reject",
+            ),
+            (
+                {
+                    "communication_buffers": {
+                        "tier": "hbf",
+                        "allow_hbf_staging": True,
+                    }
+                },
+                "communication buffers",
+            ),
+        )
+        for tiering, message in cases:
+            instance = _instance(hbf=True)
+            instance["memory_tiering"] = tiering
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    serving_main._build_instance_runtime_configs(
+                        [instance],
+                        _args(),
+                        {"bfloat16": 16},
+                        placements=[_placement()],
+                    )
+
+    @patch.object(
+        serving_main,
+        "get_config",
+        return_value={
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 32,
+        },
+    )
+    def test_runtime_rejects_unmodeled_pd_and_uneven_prefix_paths(self, _):
+        pd_instance = _instance(hbf=True)
+        pd_instance["pd_type"] = "decode"
+        pd_instance["memory_tiering"]["kv"] = {"policy": "hbf_only"}
+        with self.assertRaisesRegex(RuntimeError, "tier-aware"):
+            serving_main._build_instance_runtime_configs(
+                [pd_instance],
+                _args(),
+                {"bfloat16": 16},
+                placements=[_placement()],
+            )
+
+        prefix_instance = _instance(hbf=True)
+        prefix_instance["pp_size"] = 3
+        with self.assertRaisesRegex(RuntimeError, "能整除"):
+            serving_main._build_instance_runtime_configs(
+                [prefix_instance],
+                _args(),
+                {"bfloat16": 16},
+                placements=[_placement()],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
