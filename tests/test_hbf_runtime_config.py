@@ -1,6 +1,9 @@
 import unittest
 import sys
 import types
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -60,6 +63,37 @@ def _instance(*, hbf=False):
 
 
 class HbfRuntimeConfigTest(unittest.TestCase):
+    def test_tiering_stats_collection_skips_ordinary_instances(self):
+        snapshot = SimpleNamespace(
+            to_dict=lambda: {
+                "schema": "llmservingsim_memory_tiering_stats_v1"
+            }
+        )
+        schedulers = [
+            SimpleNamespace(
+                memory=SimpleNamespace(
+                    tiering_stats_snapshot=lambda: None
+                )
+            ),
+            SimpleNamespace(
+                memory=SimpleNamespace(
+                    tiering_stats_snapshot=lambda: snapshot
+                )
+            ),
+        ]
+
+        payload = serving_main._collect_memory_tiering_stats(schedulers)
+
+        self.assertEqual(len(payload["instances"]), 1)
+        self.assertEqual(payload["instances"][0]["instance_id"], 1)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "stats.json"
+            serving_main._write_memory_tiering_stats(path, payload)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                payload,
+            )
+
     @patch.object(
         serving_main,
         "get_config",

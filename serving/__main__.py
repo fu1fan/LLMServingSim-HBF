@@ -108,6 +108,33 @@ def _cleanup_inputs_root(run_paths, logger):
     logger.info("Removed ASTRA-Sim inputs root: %s", inputs_root)
 
 
+def _collect_memory_tiering_stats(schedulers):
+    instances = []
+    for instance_id, scheduler in enumerate(schedulers):
+        snapshot = scheduler.memory.tiering_stats_snapshot()
+        if snapshot is None:
+            continue
+        instances.append(
+            {
+                "instance_id": instance_id,
+                **snapshot.to_dict(),
+            }
+        )
+    return {
+        "schema": "llmservingsim_memory_tiering_run_v1",
+        "instances": instances,
+    }
+
+
+def _write_memory_tiering_stats(path, payload):
+    if path is None:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _prepare_ns3_config(astra_sim, run_paths):
     template = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
     output_dir = os.path.join(run_paths.inputs_root, "ns3", "output")
@@ -316,6 +343,12 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='path for per-request CSV output with latency metrics (TTFT, TPOT, ITL). '
                         'If None, results are printed to stdout only. Supports {run_id} placeholder')
+    parser.add_argument(
+        "--memory-tiering-stats-output",
+        type=str,
+        default=None,
+        help="optional JSON output for HBM/HBF residency and explicit-transfer statistics; supports {run_id}",
+    )
     parser.add_argument('--run-id', type=str, default=None,
                         help='unique id for this simulation run. Intermediate ASTRA-Sim inputs are written under '
                         'astra-sim/inputs/runs/<run-id>. If omitted, a process-unique id is generated')
@@ -347,6 +380,10 @@ def main():
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+    args.memory_tiering_stats_output = _resolve_output_file(
+        args.memory_tiering_stats_output,
+        args.run_id,
+    )
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -1093,6 +1130,23 @@ def main():
         power_model.print_power_summary()
         print_markup(f"Power per {1/RATIO} sec (W): {power_model.power_time_series}")
         print_rule()
+    tiering_stats = _collect_memory_tiering_stats(schedulers)
+    if tiering_stats["instances"]:
+        print_rule("[sim.tagline]HBM/HBF Tiering Results[/]")
+        for item in tiering_stats["instances"]:
+            transfers = item["explicit_transfers"]["directions"]
+            hbm_high = item["resident_high_water_bytes"]["hbm"]
+            hbf_high = item["resident_high_water_bytes"]["hbf"]
+            print_markup(
+                f"Instance \\[{item['instance_id']}]: "
+                f"HBM high-water={hbm_high}, HBF high-water={hbf_high}, "
+                f"explicit transfers={transfers}"
+            )
+        print_rule()
+    _write_memory_tiering_stats(
+        args.memory_tiering_stats_output,
+        tiering_stats,
+    )
     # Each instacne results
     for i in range(num_instances):
         print_rule(f"[sim.tagline]Instance \\[{i}][/]")
