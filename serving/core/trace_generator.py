@@ -11,13 +11,19 @@ from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
 from .logger import get_logger
 from .run_paths import input_path
+from .profile_contract import (
+    ProfileV2RuntimeNotReadyError,
+    load_profile_contract,
+    validate_memory_profile_id,
+)
 import bisect
 from dataclasses import dataclass, field
 
 # ----------------------------------------------------------------------
-# Global in-memory cache for the profiler's per-category performance DB.
-# key: (hardware, model, variant)
-# value: dict with keys {meta, architecture, catalog, sequence, tables}
+# Profiler 类别性能库的进程内缓存。
+# v1 键：(hardware, model, variant)
+# v2 键：(hardware, model, variant, memory_profile_id)
+# 值：包含 meta、architecture、catalog、sequence 和 tables 的字典。
 # ----------------------------------------------------------------------
 _perf_db_cache = {}
 
@@ -78,6 +84,29 @@ def _arch_yaml_path(model_type):
 
 def _variant_root(hardware, model, variant):
     return f"{_PROFILER_ROOT_REL}/perf/{hardware}/{model}/{variant}"
+
+
+def _profile_root(hardware, model, variant, memory_profile_id=None):
+    """保持 v1 路径不变；v2 在 variant 下增加稳定身份目录。"""
+    root = _variant_root(hardware, model, variant)
+    if memory_profile_id is None:
+        return root
+    profile_id = validate_memory_profile_id(
+        memory_profile_id,
+        field="memory_profile_id",
+    )
+    return os.path.join(root, profile_id)
+
+
+def _perf_db_cache_key(hardware, model, variant, memory_profile_id=None):
+    """v1 沿用三元键，v2 用第四维隔离不同硬件内存配置。"""
+    if memory_profile_id is None:
+        return (hardware, model, variant)
+    profile_id = validate_memory_profile_id(
+        memory_profile_id,
+        field="memory_profile_id",
+    )
+    return (hardware, model, variant, profile_id)
 
 
 # ======================================================================
@@ -323,26 +352,48 @@ def _build_moe_table(df):
             "rows": [tokens_by_experts[a] for a in ae_vals]}
 
 
-def _load_perf_db(hardware, model, variant, tp_needed, model_type):
+def _load_perf_db(hardware, model, variant, tp_needed, model_type,
+                  memory_profile_id=None):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
     """
-    cache_key = (hardware, model, variant)
+    cache_key = _perf_db_cache_key(
+        hardware,
+        model,
+        variant,
+        memory_profile_id,
+    )
     if cache_key in _perf_db_cache:
         db = _perf_db_cache[cache_key]
         _check_tp_coverage(db, tp_needed, hardware, model, variant)
         return db
 
-    root = _variant_root(hardware, model, variant)
+    root = _profile_root(hardware, model, variant, memory_profile_id)
     if not os.path.isdir(root):
+        if memory_profile_id is None:
+            raise FileNotFoundError(
+                f"Profile variant folder not found: {root}. Run the profiler "
+                f"with matching --dtype / --kv-cache-dtype, or pick an existing "
+                f"variant under {os.path.dirname(root)}."
+            )
         raise FileNotFoundError(
-            f"Profile variant folder not found: {root}. Run the profiler "
-            f"with matching --dtype / --kv-cache-dtype, or pick an existing "
-            f"variant under {os.path.dirname(root)}."
+            f"Profile v2 bundle folder not found: {root}. Run the exporter "
+            "with a matching memory_profile_id."
         )
 
-    meta = _load_meta(root)
+    contract = load_profile_contract(
+        root,
+        requested_memory_profile_id=memory_profile_id,
+    )
+    if contract.is_v2:
+        # lookup 尚未接收 scenario；在此硬拒绝，避免静默混用不同放置场景。
+        raise ProfileV2RuntimeNotReadyError(
+            f"Profile v2 bundle {root} 已通过静态契约校验，但 "
+            "scenario-aware lookup 尚未接线，当前拒绝运行时加载"
+        )
+
+    meta = contract.meta
     _hydrate_skew_fit_tables(meta, root)
     arch = _load_architecture(model_type)
     tables_per_tp = {}
