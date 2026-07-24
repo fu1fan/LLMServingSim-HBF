@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from .utils import get_config
 from .radix_tree import *
-from .memory_tiering import MemoryTier
+from .memory_tiering import MemoryObjectKind, MemoryTier
+from .memory_tiering_stats import MemoryTieringStats
 from .residency_scenario import BatchMemoryView
 import logging
 from enum import Enum
@@ -126,6 +127,17 @@ class MemoryModel():
                 f"HBF weight {self.hbf_used / GB_TO_BYTE:.2f}GB exceeds "
                 f"HBF memory {self.hbf_mem / GB_TO_BYTE:.2f}GB"
             )
+        self.tiering_stats = (
+            MemoryTieringStats(num_ranks=self.num_npus)
+            if self.tiering_enabled
+            else None
+        )
+        if self.tiering_stats is not None:
+            self.tiering_stats.record_policy_action(
+                "register",
+                count=len(self._weight_tiers),
+            )
+            self._observe_tiering_usage()
 
         if self.tiering_enabled and enable_prefix_caching:
             if (
@@ -528,6 +540,7 @@ class MemoryModel():
         if not self.is_kv_plan_avail(plan):
             raise RuntimeError("KV 容量事务超过 HBM/HBF 可用容量")
 
+        previous = dict(self._kv_records)
         for device, used in (
             (Device.NPU, self._hbm_used_by_rank),
             (Device.HBF, self._hbf_used_by_rank),
@@ -544,6 +557,20 @@ class MemoryModel():
         self._kv_transfer_events.extend(plan.transfers)
         self._kv_version += 1
         self._sync_accelerator_usage()
+        if self.tiering_stats is not None:
+            for record in plan.records:
+                old = previous.get((record.request_id, record.layer_index))
+                if old is None:
+                    action = "register"
+                elif old.tier is record.tier:
+                    action = "keep"
+                else:
+                    action = "migrate"
+                self.tiering_stats.record_policy_action(action)
+            self.tiering_stats.record_residency_batch(
+                hit=not bool(plan.transfers)
+            )
+            self._observe_tiering_usage()
         return plan.transfers
 
     def release_request_kv(self, req):
@@ -575,12 +602,43 @@ class MemoryModel():
         if keys:
             self._kv_version += 1
             self._sync_accelerator_usage()
+            self._observe_tiering_usage()
         return MappingProxyType(released)
 
     def take_kv_transfer_events(self):
         events = tuple(self._kv_transfer_events)
         self._kv_transfer_events.clear()
         return events
+
+    def complete_kv_transfer_events(self, events):
+        """在 ASTRA batch 完成后提交迁移统计。"""
+
+        if self.tiering_stats is None:
+            return
+        for event in events:
+            self.tiering_stats.record_explicit_transfer(
+                source=event.source,
+                target=event.target,
+                bytes_per_rank=(event.bytes_per_rank,) * self.num_npus,
+                reason=event.reason,
+                object_kind=MemoryObjectKind.KV,
+                layer_index=event.layer_index,
+            )
+
+    def _observe_tiering_usage(self):
+        if self.tiering_stats is None:
+            return
+        self.tiering_stats.observe_usage(
+            {
+                MemoryTier.HBM: tuple(self._hbm_used_by_rank),
+                MemoryTier.HBF: tuple(self._hbf_used_by_rank),
+            }
+        )
+
+    def tiering_stats_snapshot(self):
+        if self.tiering_stats is None:
+            return None
+        return self.tiering_stats.snapshot()
 
     def kv_tier_of(self, request_id, layer_index):
         try:
@@ -603,6 +661,16 @@ class MemoryModel():
                 record = self._kv_records.get((str(req.id), layer_index))
                 kv_tiers[(str(req.id), layer_index)] = (
                     record.tier if record is not None else fallback
+                )
+        if self.tiering_stats is not None and requests:
+            for layer_index in range(self.n_layer):
+                tiers = {
+                    kv_tiers[(str(req.id), layer_index)]
+                    for req in requests
+                }
+                self.tiering_stats.record_attention_groups(
+                    hbm_groups=int(MemoryTier.HBM in tiers),
+                    hbf_groups=int(MemoryTier.HBF in tiers),
                 )
         return BatchMemoryView(
             snapshot_version=self._kv_version,

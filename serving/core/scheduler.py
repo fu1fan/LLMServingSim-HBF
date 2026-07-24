@@ -803,6 +803,10 @@ class Scheduler:
             "Batch #%d is done",
             batch.batch_id,
         )
+        if self.memory.tiering_enabled:
+            self.memory.complete_kv_transfer_events(
+                batch.memory_transfers
+            )
                 
         pool = []
         for req in batch.requests:

@@ -218,34 +218,91 @@ class MemoryTieringStats:
                     used[rank] + reserved[rank],
                 )
 
-    def record_completed_transfer(self, operation: TransferOperation) -> None:
-        """记录 ASTRA 已完成的显式搬运，而非 Profile demand 访存。"""
+    def observe_usage(self, used_bytes, reserved_bytes=None) -> None:
+        """观察未使用 TieredResidencyManager 的运行时容量账本。"""
 
-        if not isinstance(operation, TransferOperation):
-            raise TypeError("operation 必须是 TransferOperation")
-        if operation.source is operation.target:
+        if not isinstance(used_bytes, Mapping):
+            raise TypeError("used_bytes 必须是 mapping")
+        reserved_bytes = reserved_bytes or {}
+        if not isinstance(reserved_bytes, Mapping):
+            raise TypeError("reserved_bytes 必须是 mapping")
+        for tier in _CAPACITY_TIERS:
+            used = _validate_rank_values(
+                used_bytes.get(tier, (0,) * self.num_ranks),
+                self.num_ranks,
+                f"{tier.value} used_bytes",
+            )
+            reserved = _validate_rank_values(
+                reserved_bytes.get(tier, (0,) * self.num_ranks),
+                self.num_ranks,
+                f"{tier.value} reserved_bytes",
+            )
+            for rank in range(self.num_ranks):
+                self._resident_high_water[tier][rank] = max(
+                    self._resident_high_water[tier][rank],
+                    used[rank],
+                )
+                self._capacity_high_water[tier][rank] = max(
+                    self._capacity_high_water[tier][rank],
+                    used[rank] + reserved[rank],
+                )
+
+    def record_explicit_transfer(
+        self,
+        *,
+        source,
+        target,
+        bytes_per_rank,
+        reason,
+        object_kind,
+        layer_index=None,
+    ) -> None:
+        """记录一个已由 ASTRA 完成的通用显式搬运。"""
+
+        if not isinstance(source, MemoryTier) or not isinstance(
+            target,
+            MemoryTier,
+        ):
+            raise TypeError("source 和 target 必须是 MemoryTier")
+        if source is target:
             raise ValueError("显式迁移的 source 与 target 不能相同")
+        if not isinstance(object_kind, MemoryObjectKind):
+            raise TypeError("object_kind 必须是 MemoryObjectKind")
         sizes = _validate_rank_values(
-            operation.bytes_per_rank,
+            bytes_per_rank,
             self.num_ranks,
-            "operation.bytes_per_rank",
+            "bytes_per_rank",
         )
-        reason = _name(operation.reason, "operation.reason")
+        reason = _name(reason, "reason")
         self._increment_bytes(
             self._transfer_directions,
-            (operation.source, operation.target),
+            (source, target),
             sizes,
         )
         self._increment_bytes(self._transfers_by_reason, reason, sizes)
         self._increment_bytes(
             self._transfers_by_object_kind,
-            operation.object_key.kind,
+            object_kind,
             sizes,
         )
         self._increment_bytes(
             self._transfers_by_layer,
-            operation.object_key.layer_index,
+            layer_index,
             sizes,
+        )
+
+    def record_completed_transfer(self, operation: TransferOperation) -> None:
+        """记录 ASTRA 已完成的显式搬运，而非 Profile demand 访存。"""
+
+        if not isinstance(operation, TransferOperation):
+            raise TypeError("operation 必须是 TransferOperation")
+        self.record_explicit_transfer(
+            source=operation.source,
+            target=operation.target,
+            bytes_per_rank=operation.bytes_per_rank,
+            reason=operation.reason,
+            object_kind=operation.object_key.kind,
+            layer_index=operation.object_key.layer_index,
         )
 
     def record_policy_action(self, action, *, count: int = 1) -> None:

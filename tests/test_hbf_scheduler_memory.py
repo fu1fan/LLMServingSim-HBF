@@ -237,6 +237,18 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
             )
         )
         self.assertEqual(memory.npu_used, memory.hbm_weight)
+        memory.complete_kv_transfer_events(events)
+        stats = memory.tiering_stats_snapshot()
+        self.assertEqual(
+            stats.transfer_directions[
+                (MemoryTier.HBM, MemoryTier.HBF)
+            ].operations,
+            _MODEL_CONFIG["num_hidden_layers"],
+        )
+        self.assertGreater(
+            stats.resident_high_water_bytes[MemoryTier.HBF][0],
+            memory.hbf_weight,
+        )
 
     def test_hbf_capacity_check_is_independent_from_hbm(self):
         config = _tiering(

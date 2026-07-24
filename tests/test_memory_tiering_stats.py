@@ -12,6 +12,33 @@ from serving.core.memory_tiering_stats import MemoryTieringStats
 
 
 class MemoryTieringStatsCapacityTest(unittest.TestCase):
+    def test_runtime_usage_without_residency_manager_is_supported(self):
+        stats = MemoryTieringStats(num_ranks=2)
+        stats.observe_usage(
+            {
+                MemoryTier.HBM: (30, 40),
+                MemoryTier.HBF: (50, 60),
+            }
+        )
+        stats.record_explicit_transfer(
+            source=MemoryTier.HBF,
+            target=MemoryTier.HBM,
+            bytes_per_rank=(5, 8),
+            reason="kv_threshold",
+            object_kind=MemoryObjectKind.KV,
+            layer_index=2,
+        )
+
+        snapshot = stats.snapshot()
+        self.assertEqual(
+            snapshot.resident_high_water_bytes[MemoryTier.HBF],
+            (50, 60),
+        )
+        self.assertEqual(
+            snapshot.transfers_by_layer[2].bytes_per_rank,
+            (5, 8),
+        )
+
     def test_tracks_resident_and_reserved_high_water_per_rank(self):
         manager = TieredResidencyManager(
             {
