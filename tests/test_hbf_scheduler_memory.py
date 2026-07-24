@@ -246,8 +246,9 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
                 for layer in range(_MODEL_CONFIG["num_hidden_layers"])
             )
         )
-        self.assertEqual(memory.npu_used, memory.hbm_weight)
+        self.assertGreater(memory.npu_used, memory.hbm_weight)
         memory.complete_kv_transfer_events(events)
+        self.assertEqual(memory.npu_used, memory.hbm_weight)
         stats = memory.tiering_stats_snapshot()
         self.assertEqual(
             stats.transfer_directions[
@@ -314,7 +315,7 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         )
         self.assertEqual(
             crossing.used_delta[Device.NPU],
-            (-384, -384, -256, -256),
+            (0, 0, 0, 0),
         )
         self.assertEqual(
             crossing.used_delta[Device.HBF],
@@ -326,6 +327,7 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         )
 
         memory.apply_kv_plan(crossing)
+        memory.complete_kv_transfer_events(crossing.transfers)
         memory.release_request_kv(req)
         self.assertEqual(
             memory._hbm_used_by_rank,
@@ -383,6 +385,19 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "RadixCache"):
             _memory(prefix_hbf, prefix=True)
 
+    def test_tiered_generic_allocation_updates_residency_high_water(self):
+        memory = _memory(_tiering())
+        before = tuple(memory._hbm_used_by_rank)
+
+        memory.allocate(128, Device.NPU)
+
+        snapshot = memory.tiering_stats_snapshot()
+        self.assertEqual(
+            snapshot.resident_high_water_bytes[MemoryTier.HBM],
+            tuple(value + 128 for value in before),
+        )
+        memory.free(128, Device.NPU)
+
     def test_scheduler_attaches_real_residency_and_releases_finished_kv(self):
         config = _tiering(
             weights={"policy": "hbf_only"},
@@ -429,6 +444,23 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
             MemoryTier.HBF,
         )
         self.assertEqual(scheduler.request[0], req)
+
+    def test_failed_pd_decode_admission_does_not_take_request_ownership(self):
+        config = _tiering(
+            kv={"policy": "hbf_only"},
+            hbf_gb=0.00000001,
+        )
+        scheduler = _scheduler(config, pd_type="decode")
+        req = Request(6, "test-model", 16, 32, 0, 0, is_init=False)
+        req.num_computed_tokens = 16
+        req.instance_id = 99
+
+        with self.assertRaisesRegex(RuntimeError, "无法容纳"):
+            scheduler.add_decode(req)
+
+        self.assertEqual(scheduler.request, [])
+        self.assertEqual(req.instance_id, 99)
+        self.assertEqual(scheduler.memory._kv_records, {})
 
 
 if __name__ == "__main__":

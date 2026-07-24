@@ -940,8 +940,6 @@ class Scheduler:
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
-        req.instance_id = self.instance_id
-        self.request.append(req)
         if self.enable_prefix_caching:
             self.memory.prefix_match(req)
             kv_size = self.memory.get_evict_kv(req)
@@ -960,6 +958,9 @@ class Scheduler:
             else:
                 kv_size = self.memory.get_total_kv(req)
                 self.memory.allocate(kv_size, Device.NPU)
+        # 容量事务成功后才转移请求所有权，失败时路由器仍可安全处理原请求。
+        req.instance_id = self.instance_id
+        self.request.append(req)
     
     # get first request's arrival time
     def get_first_arrival_time(self):

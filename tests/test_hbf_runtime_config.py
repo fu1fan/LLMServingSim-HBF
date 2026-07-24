@@ -5,7 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 pyinstrument = types.ModuleType("pyinstrument")
 pyinstrument.Profiler = object
@@ -63,6 +63,31 @@ def _instance(*, hbf=False):
 
 
 class HbfRuntimeConfigTest(unittest.TestCase):
+    def test_shutdown_checks_every_instance_memory(self):
+        memories = [
+            SimpleNamespace(
+                free_prefix_cache=Mock(),
+                free_weight=Mock(),
+                is_free=Mock(return_value=True),
+            )
+            for _ in range(2)
+        ]
+
+        serving_main._release_instance_memory(
+            [SimpleNamespace(memory=item) for item in memories]
+        )
+
+        for memory in memories:
+            memory.free_prefix_cache.assert_called_once_with()
+            memory.free_weight.assert_called_once_with()
+            memory.is_free.assert_called_once_with()
+
+        memories[0].is_free.return_value = False
+        with self.assertRaisesRegex(RuntimeError, r"\[0\]"):
+            serving_main._release_instance_memory(
+                [SimpleNamespace(memory=item) for item in memories]
+            )
+
     def test_tiering_stats_collection_skips_ordinary_instances(self):
         snapshot = SimpleNamespace(
             to_dict=lambda: {

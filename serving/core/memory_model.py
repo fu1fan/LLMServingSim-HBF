@@ -508,9 +508,8 @@ class MemoryModel():
                         delta[target_device][rank] += change
                         growth[rank] += max(change, 0)
                 else:
-                    source_device = self._device_for_tier(current.tier)
                     for rank in rank_ids:
-                        delta[source_device][rank] -= current.bytes_per_rank
+                        # 迁移完成前源副本仍占容量，目标侧先做完整预留。
                         delta[target_device][rank] += desired_bytes
                         growth[rank] += max(
                             desired_bytes - current.bytes_per_rank,
@@ -656,20 +655,42 @@ class MemoryModel():
         """在 ASTRA batch 完成后提交迁移统计。"""
 
         if self.tiering_stats is None:
-            return
+            stats_enabled = False
+        else:
+            stats_enabled = True
         for event in events:
             rank_bytes = [0] * self.num_npus
             first = event.pp_stage * self.tp_size
             for rank in range(first, first + self.tp_size):
                 rank_bytes[rank] = event.bytes_per_rank
-            self.tiering_stats.record_explicit_transfer(
-                source=event.source,
-                target=event.target,
-                bytes_per_rank=tuple(rank_bytes),
-                reason=event.reason,
-                object_kind=MemoryObjectKind.KV,
-                layer_index=event.layer_index,
+            source_used = (
+                self._hbm_used_by_rank
+                if event.source is MemoryTier.HBM
+                else self._hbf_used_by_rank
             )
+            source_weight = (
+                self._hbm_weight_by_rank
+                if event.source is MemoryTier.HBM
+                else self._hbf_weight_by_rank
+            )
+            for rank, size in enumerate(rank_bytes):
+                if source_used[rank] - size < source_weight[rank]:
+                    raise RuntimeError(
+                        "KV 迁移完成时源层容量小于待释放副本"
+                    )
+                source_used[rank] -= size
+            if stats_enabled:
+                self.tiering_stats.record_explicit_transfer(
+                    source=event.source,
+                    target=event.target,
+                    bytes_per_rank=tuple(rank_bytes),
+                    reason=event.reason,
+                    object_kind=MemoryObjectKind.KV,
+                    layer_index=event.layer_index,
+                )
+        if events:
+            self._sync_accelerator_usage()
+            self._observe_tiering_usage()
 
     def _observe_tiering_usage(self):
         if self.tiering_stats is None:
@@ -825,12 +846,10 @@ class MemoryModel():
             if not is_free:
                 self.logger.error(
                     "Memory leak detected: NPU used: %.2fMB, CPU used: %.2fMB",
-                    self.node_id,
-                    self.instance_id,
                     self.npu_used / MB_TO_BYTE,
                     self.cpu_used / MB_TO_BYTE,
                 )
-            return
+            return is_free
         is_free = (
             self.npu_used == 0
             and self.hbf_used == 0
@@ -843,7 +862,7 @@ class MemoryModel():
                 self.hbf_used / MB_TO_BYTE,
                 self.cpu_used / MB_TO_BYTE,
             )
-        return
+        return is_free
 
     # -------------------- Memory Management --------------------
     
@@ -862,6 +881,7 @@ class MemoryModel():
                 for rank in range(self.num_npus):
                     self._hbm_used_by_rank[rank] += size
                 self._sync_accelerator_usage()
+                self._observe_tiering_usage()
                 return
             if self.npu_used + size > self.npu_mem:
                 raise RuntimeError(
@@ -909,6 +929,7 @@ class MemoryModel():
             for rank in range(self.num_npus):
                 self._hbf_used_by_rank[rank] += size
             self._sync_accelerator_usage()
+            self._observe_tiering_usage()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
@@ -924,6 +945,7 @@ class MemoryModel():
                 for rank in range(self.num_npus):
                     self._hbm_used_by_rank[rank] -= size
                 self._sync_accelerator_usage()
+                self._observe_tiering_usage()
                 return
             if self.npu_used - size < self.weight:
                 raise RuntimeError(
@@ -969,6 +991,7 @@ class MemoryModel():
             for rank in range(self.num_npus):
                 self._hbf_used_by_rank[rank] -= size
             self._sync_accelerator_usage()
+            self._observe_tiering_usage()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free KV cache in unsupported device {device}")
     

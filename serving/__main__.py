@@ -135,6 +135,19 @@ def _write_memory_tiering_stats(path, payload):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _release_instance_memory(schedulers):
+    """释放并逐实例验证模拟器持有的全部内存。"""
+
+    leaked = []
+    for instance_id, scheduler in enumerate(schedulers):
+        scheduler.memory.free_prefix_cache()
+        scheduler.memory.free_weight()
+        if not scheduler.memory.is_free():
+            leaked.append(instance_id)
+    if leaked:
+        raise RuntimeError(f"实例内存未完全释放：{leaked}")
+
+
 def _prepare_ns3_config(astra_sim, run_paths):
     template = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
     output_dir = os.path.join(run_paths.inputs_root, "ns3", "output")
@@ -1037,12 +1050,7 @@ def main():
 
             # check if all instances are done
             if len(done_instance) == num_instances:
-                for inst_idx in range(num_instances):
-                    schedulers[inst_idx].memory.free_prefix_cache()
-                    schedulers[inst_idx].memory.free_weight()
-                
-                # check memory leak before exit
-                schedulers[inst_idx].memory.is_free()
+                _release_instance_memory(schedulers)
 
                 print_rule()
                 print_markup("[sim.heading]▶ Exiting simulation...[/]\n")
