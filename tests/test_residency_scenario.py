@@ -2,6 +2,7 @@ import unittest
 
 from serving.core.memory_tiering import MemoryTier
 from serving.core.residency_scenario import (
+    BatchMemoryView,
     ResidencyScenarioError,
     ResidencyScenarioResolver,
 )
@@ -57,6 +58,48 @@ def _scenario_catalog():
 
 
 class ResidencyScenarioResolverTest(unittest.TestCase):
+    def test_batch_view_uses_exact_weight_and_request_layer_kv(self):
+        view = BatchMemoryView(
+            snapshot_version=7,
+            weight_tiers={
+                ("qkv_proj", None): MemoryTier.HBM,
+                ("qkv_proj", 3): MemoryTier.HBF,
+            },
+            kv_tiers={
+                ("10", 3): MemoryTier.HBF,
+                ("11", 3): MemoryTier.HBM,
+            },
+        )
+
+        self.assertEqual(
+            view.weight_tier("qkv_proj", 3),
+            MemoryTier.HBF,
+        )
+        self.assertEqual(
+            view.weight_tier("qkv_proj", 2),
+            MemoryTier.HBM,
+        )
+        self.assertEqual(
+            view.kv_groups([10, 11], 3),
+            {
+                MemoryTier.HBF: ("10",),
+                MemoryTier.HBM: ("11",),
+            },
+        )
+
+    def test_batch_view_rejects_missing_request_layer_binding(self):
+        view = BatchMemoryView(
+            snapshot_version=0,
+            weight_tiers={("attention", None): MemoryTier.HBM},
+            kv_tiers={},
+        )
+
+        with self.assertRaisesRegex(
+            ResidencyScenarioError,
+            "request=1.*layer=0",
+        ):
+            view.kv_tier(1, 0)
+
     def test_weight_scenario_comes_from_actual_residency(self):
         resolver = ResidencyScenarioResolver(
             _access_catalog(),

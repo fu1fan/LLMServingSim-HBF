@@ -37,6 +37,89 @@ class RuntimeScenarioBinding:
     access_tiers: Mapping[str, MemoryTier]
 
 
+@dataclass(frozen=True)
+class BatchMemoryView:
+    """一个 batch 生成 Trace 时不可变的对象驻留视图。"""
+
+    snapshot_version: int
+    weight_tiers: Mapping[tuple[str, int | None], MemoryTier]
+    kv_tiers: Mapping[tuple[str, int], MemoryTier]
+
+    def __post_init__(self):
+        if (
+            isinstance(self.snapshot_version, bool)
+            or not isinstance(self.snapshot_version, int)
+            or self.snapshot_version < 0
+        ):
+            raise ValueError("snapshot_version 必须是非负整数")
+        for field, mapping in (
+            ("weight_tiers", self.weight_tiers),
+            ("kv_tiers", self.kv_tiers),
+        ):
+            if not isinstance(mapping, Mapping):
+                raise TypeError(f"{field} 必须是 mapping")
+            for tier in mapping.values():
+                if tier not in {MemoryTier.HBM, MemoryTier.HBF}:
+                    raise ResidencyScenarioError(
+                        f"{field} 只允许 HBM/HBF 驻留"
+                    )
+        object.__setattr__(
+            self,
+            "weight_tiers",
+            MappingProxyType(dict(self.weight_tiers)),
+        )
+        object.__setattr__(
+            self,
+            "kv_tiers",
+            MappingProxyType(dict(self.kv_tiers)),
+        )
+
+    def weight_tier(
+        self,
+        layer_name: str,
+        block_index: int | None,
+    ) -> MemoryTier:
+        """按精确 block、共享层定义的顺序读取权重驻留。"""
+
+        exact = (layer_name, block_index)
+        shared = (layer_name, None)
+        if exact in self.weight_tiers:
+            return self.weight_tiers[exact]
+        if shared in self.weight_tiers:
+            return self.weight_tiers[shared]
+        raise ResidencyScenarioError(
+            f"驻留视图缺少 weight {layer_name!r} block={block_index}"
+        )
+
+    def kv_tier(self, request_id: object, layer_index: int) -> MemoryTier:
+        key = (str(request_id), layer_index)
+        try:
+            return self.kv_tiers[key]
+        except KeyError as exc:
+            raise ResidencyScenarioError(
+                f"驻留视图缺少 request={request_id!r} layer={layer_index} 的 KV"
+            ) from exc
+
+    def kv_groups(
+        self,
+        request_ids,
+        layer_index: int,
+    ) -> Mapping[MemoryTier, tuple[str, ...]]:
+        groups = {}
+        for request_id in request_ids:
+            tier = self.kv_tier(request_id, layer_index)
+            groups.setdefault(tier, []).append(str(request_id))
+        return MappingProxyType(
+            {
+                tier: tuple(ids)
+                for tier, ids in sorted(
+                    groups.items(),
+                    key=lambda item: item[0].value,
+                )
+            }
+        )
+
+
 _WEIGHT_SEMANTICS = {"weight"}
 _KV_SEMANTICS = {"kv_cache"}
 _KNOWN_ACCESS_TYPES = {"read", "write", "read_write"}
@@ -255,4 +338,3 @@ class ResidencyScenarioResolver:
                         )
                     )
         return tuple(bindings)
-
