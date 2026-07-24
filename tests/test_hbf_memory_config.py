@@ -17,27 +17,47 @@ def _integration(mode="cli", fabric=None):
     return {
         "mode": mode,
         "parameters": {
+            "schema_version": 1,
+            "timing_model": "directional_v1",
             "integration_mode": mode,
+            "bandwidth_scope": "pure_direction_effective",
+            "fabric_model": (
+                "none" if fabric is None else "distinct_shared_resource"
+            ),
             "gpu_memory_fabric_bandwidth_byte_per_second": fabric,
             "tiers": {
                 "hbm": {
+                    "read_write_service": "time_shared",
                     "read": {
                         "bandwidth_byte_per_second": 2e12,
                         "fixed_latency_second": 1e-6,
+                        "latency_scope": "per_stream",
+                        "request_granularity_byte": 32,
+                        "max_inflight_requests": 1,
                     },
                     "write": {
                         "bandwidth_byte_per_second": 1e12,
                         "fixed_latency_second": 2e-6,
+                        "latency_scope": "per_stream",
+                        "request_granularity_byte": 32,
+                        "max_inflight_requests": 1,
                     },
                 },
                 "hbf": {
+                    "read_write_service": "time_shared",
                     "read": {
                         "bandwidth_byte_per_second": 4e12,
                         "fixed_latency_second": 5e-6,
+                        "latency_scope": "per_stream",
+                        "request_granularity_byte": 4096,
+                        "max_inflight_requests": 1,
                     },
                     "write": {
                         "bandwidth_byte_per_second": 2.5e11,
                         "fixed_latency_second": 2e-4,
+                        "latency_scope": "per_stream",
+                        "request_granularity_byte": 4096,
+                        "max_inflight_requests": 1,
                     },
                 },
             },
@@ -57,23 +77,52 @@ class HbfMemoryConfigTest(unittest.TestCase):
             spec.hbf_mem["service-group"],
         )
 
-    def test_csi_uses_one_optional_fabric_limited_service(self):
-        spec = astra_memory_spec_from_integration(
-            _integration("csi", fabric=1.5e12)
-        )
+    def test_csi_uses_one_shared_service(self):
+        spec = astra_memory_spec_from_integration(_integration("csi"))
 
         self.assertEqual(
             spec.local_mem["service-group"],
             spec.hbf_mem["service-group"],
         )
-        self.assertEqual(spec.local_mem["service-group-bw"], 1500)
-        self.assertEqual(spec.hbf_mem["service-group-bw"], 1500)
+        self.assertNotIn("service-group-bw", spec.local_mem)
 
     def test_mode_mismatch_is_rejected(self):
         value = _integration("cli")
         value["parameters"]["integration_mode"] = "csi"
 
-        with self.assertRaisesRegex(HbfMemoryConfigError, "不一致"):
+        with self.assertRaisesRegex(HbfMemoryConfigError, "integration_mode"):
+            astra_memory_spec_from_integration(value)
+
+    def test_zero_fixed_latency_is_preserved(self):
+        value = _integration("cli")
+        value["parameters"]["tiers"]["hbm"]["read"][
+            "fixed_latency_second"
+        ] = 0
+
+        spec = astra_memory_spec_from_integration(value)
+
+        self.assertEqual(spec.local_mem["read-mem-latency"], 0)
+
+    def test_unsupported_latency_and_fabric_models_fail_closed(self):
+        value = _integration("cli")
+        value["parameters"]["tiers"]["hbf"]["read"][
+            "latency_scope"
+        ] = "per_request_batch"
+        with self.assertRaisesRegex(HbfMemoryConfigError, "per_stream"):
+            astra_memory_spec_from_integration(value)
+
+        with self.assertRaisesRegex(HbfMemoryConfigError, "fabric_model"):
+            astra_memory_spec_from_integration(
+                _integration("csi", fabric=1.5e12)
+            )
+
+    def test_runtime_mapping_requires_complete_direction_contract(self):
+        value = _integration("cli")
+        del value["parameters"]["tiers"]["hbf"]["write"][
+            "request_granularity_byte"
+        ]
+
+        with self.assertRaisesRegex(HbfMemoryConfigError, "字段不完整"):
             astra_memory_spec_from_integration(value)
 
     def test_installer_writes_only_explicit_migration_resources(self):

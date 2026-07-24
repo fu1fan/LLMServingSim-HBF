@@ -33,22 +33,103 @@ def _positive_number(value, field):
     return float(value)
 
 
+def _nonnegative_number(value, field):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise HbfMemoryConfigError(f"{field} 必须是有限非负数")
+    return float(value)
+
+
+def _positive_int(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise HbfMemoryConfigError(f"{field} 必须是正整数")
+    return value
+
+
+def _require_exact_fields(value, expected, field):
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise HbfMemoryConfigError(
+            f"{field} 字段不完整：missing={missing}, extra={extra}"
+        )
+
+
 def _direction(tier, name, field):
     if not isinstance(tier, Mapping):
         raise HbfMemoryConfigError(f"{field} 必须是 mapping")
     value = tier.get(name)
     if not isinstance(value, Mapping):
         raise HbfMemoryConfigError(f"{field}.{name} 必须是 mapping")
+    _require_exact_fields(
+        value,
+        {
+            "bandwidth_byte_per_second",
+            "fixed_latency_second",
+            "latency_scope",
+            "request_granularity_byte",
+            "max_inflight_requests",
+        },
+        f"{field}.{name}",
+    )
+    if value.get("latency_scope") != "per_stream":
+        raise HbfMemoryConfigError(
+            f"{field}.{name}.latency_scope 当前只支持 per_stream"
+        )
+    _positive_int(
+        value.get("request_granularity_byte"),
+        f"{field}.{name}.request_granularity_byte",
+    )
+    _positive_int(
+        value.get("max_inflight_requests"),
+        f"{field}.{name}.max_inflight_requests",
+    )
     bandwidth = _positive_number(
         value.get("bandwidth_byte_per_second"),
         f"{field}.{name}.bandwidth_byte_per_second",
     )
-    latency = _positive_number(
+    latency = _nonnegative_number(
         value.get("fixed_latency_second"),
         f"{field}.{name}.fixed_latency_second",
     )
     # ASTRA analytical backend 的单位分别是十进制 GB/s 与 ns。
-    return max(1, int(bandwidth / 1e9)), max(1, math.ceil(latency * 1e9))
+    return max(1, round(bandwidth / 1e9)), round(latency * 1e9)
+
+
+def _validate_astra_integration(parameters, mode):
+    """限制为当前 ASTRA 能与 LLMCompass 等价执行的参数子集。"""
+
+    _require_exact_fields(
+        parameters,
+        {
+            "schema_version",
+            "timing_model",
+            "integration_mode",
+            "bandwidth_scope",
+            "fabric_model",
+            "gpu_memory_fabric_bandwidth_byte_per_second",
+            "tiers",
+        },
+        "memory_integration.parameters",
+    )
+    expected = {
+        "schema_version": 1,
+        "timing_model": "directional_v1",
+        "integration_mode": mode,
+        "bandwidth_scope": "pure_direction_effective",
+        "fabric_model": "none",
+        "gpu_memory_fabric_bandwidth_byte_per_second": None,
+    }
+    for field, value in expected.items():
+        if parameters.get(field) != value:
+            raise HbfMemoryConfigError(
+                f"memory_integration.parameters.{field} 必须是 {value!r}"
+            )
 
 
 def astra_memory_spec_from_integration(memory_integration):
@@ -62,13 +143,11 @@ def astra_memory_spec_from_integration(memory_integration):
     parameters = memory_integration.get("parameters")
     if not isinstance(parameters, Mapping):
         raise HbfMemoryConfigError("memory_integration.parameters 必须是 mapping")
-    if parameters.get("integration_mode") != mode:
-        raise HbfMemoryConfigError(
-            "memory_integration.mode 与 parameters.integration_mode 不一致"
-        )
+    _validate_astra_integration(parameters, mode)
     tiers = parameters.get("tiers")
     if not isinstance(tiers, Mapping):
         raise HbfMemoryConfigError("memory_integration.parameters.tiers 必须是 mapping")
+    _require_exact_fields(tiers, {"hbm", "hbf"}, "memory_integration.parameters.tiers")
 
     entries = {}
     for tier_name, location in (
@@ -76,6 +155,20 @@ def astra_memory_spec_from_integration(memory_integration):
         ("hbf", "HBF_MEMORY"),
     ):
         tier = tiers.get(tier_name)
+        if not isinstance(tier, Mapping):
+            raise HbfMemoryConfigError(
+                f"memory_integration.parameters.tiers.{tier_name} 必须是 mapping"
+            )
+        _require_exact_fields(
+            tier,
+            {"read_write_service", "read", "write"},
+            f"memory_integration.parameters.tiers.{tier_name}",
+        )
+        if tier.get("read_write_service") != "time_shared":
+            raise HbfMemoryConfigError(
+                f"memory_integration.parameters.tiers.{tier_name}."
+                "read_write_service 必须是 'time_shared'"
+            )
         read_bw, read_latency = _direction(
             tier,
             "read",
@@ -102,22 +195,6 @@ def astra_memory_spec_from_integration(memory_integration):
         # CSI 仅共享显式迁移的数据传输资源；Profile 内 demand access 不会进入 ASTRA。
         entries["hbm"]["service-group"] = "gpu-memory-data"
         entries["hbf"]["service-group"] = "gpu-memory-data"
-        fabric_bw = parameters.get(
-            "gpu_memory_fabric_bandwidth_byte_per_second"
-        )
-        if fabric_bw is not None:
-            shared_bw = max(
-                1,
-                int(
-                    _positive_number(
-                        fabric_bw,
-                        "gpu_memory_fabric_bandwidth_byte_per_second",
-                    )
-                    / 1e9
-                ),
-            )
-            entries["hbm"]["service-group-bw"] = shared_bw
-            entries["hbf"]["service-group-bw"] = shared_bw
 
     return HbfAstraMemorySpec(
         integration_mode=mode,
