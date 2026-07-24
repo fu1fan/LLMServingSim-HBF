@@ -54,6 +54,13 @@ _DTYPE_SHORT = {
 # named layer when tp_size > 1. Names must match the profiler's catalog.
 _TP_ALLREDUCE_AFTER = frozenset({"o_proj", "down_proj"})
 
+_FOUR_WAY_AUDIT_COLUMNS = (
+    "hbm_read_bytes",
+    "hbm_write_bytes",
+    "hbf_read_bytes",
+    "hbf_write_bytes",
+)
+
 
 def _short_dtype(d):
     if d is None:
@@ -185,6 +192,24 @@ class PowerAccumulator:
                 ctx.power_model.add_pim_active_energy_consumption(ctx.node_id, lat)
 
 
+@dataclass(frozen=True)
+class ProfileLatencySample:
+    """保留一次 Profile 查询的延迟和四向物理流量。"""
+
+    latency_ns: int
+    hbm_read_bytes: int = 0
+    hbm_write_bytes: int = 0
+    hbf_read_bytes: int = 0
+    hbf_write_bytes: int = 0
+
+    @property
+    def four_way_bytes(self):
+        return {
+            column: getattr(self, column)
+            for column in _FOUR_WAY_AUDIT_COLUMNS
+        }
+
+
 # ======================================================================
 # Perf DB loading and lookup (new per-category format)
 # ======================================================================
@@ -303,6 +328,16 @@ def _read_category_csv(path, key_cols):
     return df
 
 
+def _audit_values(df):
+    """按 CSV 行序保留四向物理字节；v1 表返回空 mapping。"""
+    if not all(column in df.columns for column in _FOUR_WAY_AUDIT_COLUMNS):
+        return {}
+    return {
+        column: df[column].astype(int).tolist()
+        for column in _FOUR_WAY_AUDIT_COLUMNS
+    }
+
+
 def _build_1d_table(df, layer_col, key_col):
     """Dense / per-sequence: per-layer sorted (keys, values) table."""
     out = {}
@@ -311,6 +346,7 @@ def _build_1d_table(df, layer_col, key_col):
         out[str(layer)] = {
             "keys": g[key_col].astype(int).tolist(),
             "values": g["latency_ns"].astype(int).tolist(),
+            "audit_values": _audit_values(g),
         }
     return out
 
@@ -332,6 +368,7 @@ def _build_attention_table(df):
             slice_tbl[int(kp)] = {
                 "keys": g2["kv_decode"].astype(int).tolist(),
                 "values": g2["latency_ns"].astype(int).tolist(),
+                "audit_values": _audit_values(g2),
             }
         kp_vals_s = sorted(slice_tbl.keys())
         slices[(int(pc), int(nd))] = {
@@ -353,6 +390,7 @@ def _build_moe_table(df):
         tokens_by_experts[int(ae)] = {
             "keys": g["tokens"].astype(int).tolist(),
             "values": g["latency_ns"].astype(int).tolist(),
+            "audit_values": _audit_values(g),
         }
     ae_vals = sorted(tokens_by_experts.keys())
     return {"activated_experts_vals": ae_vals,
@@ -828,6 +866,34 @@ def _lookup_1d(keys, values, query):
     return _linear_interpolate(keys[lo], values[lo], keys[hi], values[hi], query)
 
 
+def _sample_from_components(latency_ns, audit_values=None):
+    audit_values = audit_values or {}
+    return ProfileLatencySample(
+        latency_ns=max(1, int(latency_ns)),
+        **{
+            column: max(0, int(audit_values.get(column, 0)))
+            for column in _FOUR_WAY_AUDIT_COLUMNS
+        },
+    )
+
+
+def _lookup_1d_sample(table, query):
+    latency_ns = _lookup_1d(
+        table["keys"],
+        table["values"],
+        query,
+    )
+    audit_values = {
+        column: _lookup_1d(
+            table["keys"],
+            values,
+            query,
+        )
+        for column, values in (table.get("audit_values") or {}).items()
+    }
+    return _sample_from_components(latency_ns, audit_values)
+
+
 def _tp_tables(perf_db, tp):
     """Fetch the category-table dict for a given TP degree, with a
     clear error if the TP wasn't profiled.
@@ -938,6 +1004,22 @@ def _lookup_dense(
     tokens,
     memory_scenario=_LEGACY_MEMORY_SCENARIO,
 ):
+    return _lookup_dense_sample(
+        perf_db,
+        name,
+        tp,
+        tokens,
+        memory_scenario=memory_scenario,
+    ).latency_ns
+
+
+def _lookup_dense_sample(
+    perf_db,
+    name,
+    tp,
+    tokens,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
     tp_eff = _effective_tp(
         perf_db,
         "dense",
@@ -958,10 +1040,26 @@ def _lookup_dense(
         category="dense",
         layer_name=name,
     )
-    return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(tokens), 1))))
+    return _lookup_1d_sample(tbl, max(int(tokens), 1))
 
 
 def _lookup_per_sequence(
+    perf_db,
+    name,
+    tp,
+    sequences,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
+    return _lookup_per_sequence_sample(
+        perf_db,
+        name,
+        tp,
+        sequences,
+        memory_scenario=memory_scenario,
+    ).latency_ns
+
+
+def _lookup_per_sequence_sample(
     perf_db,
     name,
     tp,
@@ -989,7 +1087,7 @@ def _lookup_per_sequence(
         category="per_sequence",
         layer_name=name,
     )
-    return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
+    return _lookup_1d_sample(tbl, max(int(sequences), 1))
 
 
 def _axis_bracket(values, query):
@@ -1024,7 +1122,14 @@ def _axis_bracket(values, query):
     return lo, hi, t
 
 
-def _attn_slice_lookup(tbl, pc, nd, kv_prefill, kv_decode):
+def _attn_slice_lookup(
+    tbl,
+    pc,
+    nd,
+    kv_prefill,
+    kv_decode,
+    audit_column=None,
+):
     """Bilinear (log on each axis) within a single (pc, nd) slice."""
     slice_tbl = tbl["slices"].get((pc, nd))
     if slice_tbl is None:
@@ -1036,7 +1141,13 @@ def _attn_slice_lookup(tbl, pc, nd, kv_prefill, kv_decode):
     lo_kp, hi_kp, t_kp = _axis_bracket(kp_vals, max(int(kv_prefill), 0))
 
     def _row_lookup(row):
-        ks, vs = row["keys"], row["values"]
+        ks = row["keys"]
+        if audit_column is None:
+            vs = row["values"]
+        else:
+            vs = (row.get("audit_values") or {}).get(audit_column)
+            if vs is None:
+                return None
         if not ks:
             return None
         if len(ks) == 1:
@@ -1242,6 +1353,26 @@ def _lookup_attention(
     kv_decode,
     memory_scenario=_LEGACY_MEMORY_SCENARIO,
 ):
+    return _lookup_attention_sample(
+        perf_db,
+        tp,
+        prefill_chunk,
+        kv_prefill,
+        n_decode,
+        kv_decode,
+        memory_scenario=memory_scenario,
+    ).latency_ns
+
+
+def _lookup_attention_sample(
+    perf_db,
+    tp,
+    prefill_chunk,
+    kv_prefill,
+    n_decode,
+    kv_decode,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
     """4D log-linear interpolation on (prefill_chunk, kv_prefill,
     n_decode, kv_decode). Every axis is doubled by the profiler, so we
     bracket each axis's two nearest profiled values and blend linearly
@@ -1260,6 +1391,38 @@ def _lookup_attention(
         raise KeyError(f"Missing attention profile for tp={tp}.")
 
     pcq, ndq = max(int(prefill_chunk), 0), max(int(n_decode), 0)
+    latency_ns = _lookup_attention_table_value(
+        tbl,
+        pcq,
+        ndq,
+        kv_prefill,
+        kv_decode,
+    )
+    audit_values = {
+        column: _lookup_attention_table_value(
+            tbl,
+            pcq,
+            ndq,
+            kv_prefill,
+            kv_decode,
+            audit_column=column,
+        )
+        for column in _FOUR_WAY_AUDIT_COLUMNS
+    }
+    return _sample_from_components(latency_ns, audit_values)
+
+
+def _lookup_attention_table_value(
+    tbl,
+    pcq,
+    ndq,
+    kv_prefill,
+    kv_decode,
+    *,
+    audit_column=None,
+):
+    """在同一 Attention 网格上插值延迟或一个审计方向。"""
+
     pc_vals, nd_vals = tbl["pc_vals"], tbl["nd_vals"]
     lo_pc, hi_pc, t_pc = _axis_bracket(pc_vals, pcq)
     lo_nd, hi_nd, t_nd = _axis_bracket(nd_vals, ndq)
@@ -1267,13 +1430,26 @@ def _lookup_attention(
     # Grab the four corners; missing corners fall back to the closest
     # available (pc, nd) pair.
     def _corner(pc, nd):
-        v = _attn_slice_lookup(tbl, pc, nd, kv_prefill, kv_decode)
+        v = _attn_slice_lookup(
+            tbl,
+            pc,
+            nd,
+            kv_prefill,
+            kv_decode,
+            audit_column=audit_column,
+        )
         if v is not None:
             return v
         nearest = min(tbl["pc_nd_pairs"],
                       key=lambda p: (p[0] - pc) ** 2 + (p[1] - nd) ** 2)
-        return _attn_slice_lookup(tbl, nearest[0], nearest[1],
-                                  kv_prefill, kv_decode) or 0.0
+        return _attn_slice_lookup(
+            tbl,
+            nearest[0],
+            nearest[1],
+            kv_prefill,
+            kv_decode,
+            audit_column=audit_column,
+        ) or 0.0
 
     c00 = _corner(pc_vals[lo_pc], nd_vals[lo_nd])
     c01 = _corner(pc_vals[lo_pc], nd_vals[hi_nd])
@@ -1282,11 +1458,24 @@ def _lookup_attention(
 
     v0 = c00 + t_nd * (c01 - c00)
     v1 = c10 + t_nd * (c11 - c10)
-    out = v0 + t_pc * (v1 - v0)
-    return max(1, int(out))
+    return v0 + t_pc * (v1 - v0)
 
 
 def _lookup_moe(
+    perf_db,
+    tokens,
+    activated_experts,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
+    return _lookup_moe_sample(
+        perf_db,
+        tokens,
+        activated_experts,
+        memory_scenario=memory_scenario,
+    ).latency_ns
+
+
+def _lookup_moe_sample(
     perf_db,
     tokens,
     activated_experts,
@@ -1313,12 +1502,28 @@ def _lookup_moe(
     aeq = max(int(activated_experts), 1)
     tokq = max(int(tokens), 1)
     lo, hi = _lookup_bounds(ae_vals, aeq)
-    val_lo = _lookup_1d(rows[lo]["keys"], rows[lo]["values"], tokq)
+    sample_lo = _lookup_1d_sample(rows[lo], tokq)
     if lo == hi:
-        return max(1, int(val_lo))
-    val_hi = _lookup_1d(rows[hi]["keys"], rows[hi]["values"], tokq)
-    out = _linear_interpolate(ae_vals[lo], val_lo, ae_vals[hi], val_hi, aeq)
-    return max(1, int(out))
+        return sample_lo
+    sample_hi = _lookup_1d_sample(rows[hi], tokq)
+    latency_ns = _linear_interpolate(
+        ae_vals[lo],
+        sample_lo.latency_ns,
+        ae_vals[hi],
+        sample_hi.latency_ns,
+        aeq,
+    )
+    audit_values = {
+        column: _linear_interpolate(
+            ae_vals[lo],
+            getattr(sample_lo, column),
+            ae_vals[hi],
+            getattr(sample_hi, column),
+            aeq,
+        )
+        for column in _FOUR_WAY_AUDIT_COLUMNS
+    }
+    return _sample_from_components(latency_ns, audit_values)
 
 
 def _catalog_has(perf_db, category, name):

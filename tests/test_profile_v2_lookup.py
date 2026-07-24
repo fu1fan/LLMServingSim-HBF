@@ -162,15 +162,18 @@ def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
 
 
 def _row(filename, scenario, time_us, **shape_overrides):
+    audit = {
+        "hbm_read_bytes": shape_overrides.pop("hbm_read_bytes", 4096),
+        "hbm_write_bytes": shape_overrides.pop("hbm_write_bytes", 1024),
+        "hbf_read_bytes": shape_overrides.pop("hbf_read_bytes", 0),
+        "hbf_write_bytes": shape_overrides.pop("hbf_write_bytes", 0),
+    }
     return {
         **TABLE_SHAPES[filename],
         **shape_overrides,
         "memory_scenario": scenario,
         "time_us": time_us,
-        "hbm_read_bytes": 4096,
-        "hbm_write_bytes": 1024,
-        "hbf_read_bytes": 0,
-        "hbf_write_bytes": 0,
+        **audit,
     }
 
 
@@ -335,6 +338,114 @@ class ProfileV2LookupTest(unittest.TestCase):
                     memory_scenario="input_hbf",
                 )
             )
+
+    def test_sample_lookups_preserve_and_interpolate_four_way_bytes(self):
+        rows = {
+            "dense.csv": [
+                _row(
+                    "dense.csv",
+                    scenario,
+                    time_us,
+                    tokens=tokens,
+                    hbm_read_bytes=hbm_read,
+                    hbf_write_bytes=hbf_write,
+                )
+                for scenario in ("all_hbm", "input_hbf")
+                for tokens, time_us, hbm_read, hbf_write in (
+                    (128, 10, 4096, 1024),
+                    (256, 20, 8192, 2048),
+                )
+            ],
+            "per_sequence.csv": [
+                _row("per_sequence.csv", scenario, 10)
+                for scenario in ("all_hbm", "input_hbf")
+            ],
+            "attention.csv": [
+                _row(
+                    "attention.csv",
+                    scenario,
+                    10,
+                    hbm_write_bytes=2048,
+                    hbf_read_bytes=8192,
+                )
+                for scenario in ("all_hbm", "input_hbf")
+            ],
+            "moe.csv": [
+                _row("moe.csv", scenario, 10)
+                for scenario in ("all_hbm", "input_hbf")
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            profile_id = "sample-audit"
+            _write_bundle(
+                _bundle_path(profiler_root, profile_id),
+                profile_id,
+                rows,
+            )
+            with mock.patch.object(
+                trace_generator,
+                "_PROFILER_ROOT_REL",
+                str(profiler_root),
+            ):
+                perf_db = _load_v2(profiler_root, profile_id)
+
+        dense = trace_generator._lookup_dense_sample(
+            perf_db,
+            "qkv_proj",
+            1,
+            192,
+            memory_scenario="input_hbf",
+        )
+        self.assertIsInstance(dense, trace_generator.ProfileLatencySample)
+        self.assertEqual(dense.latency_ns, 15_000)
+        self.assertEqual(dense.hbm_read_bytes, 6144)
+        self.assertEqual(dense.hbf_write_bytes, 1536)
+        self.assertEqual(
+            trace_generator._lookup_dense(
+                perf_db,
+                "qkv_proj",
+                1,
+                192,
+                memory_scenario="input_hbf",
+            ),
+            dense.latency_ns,
+        )
+
+        attention = trace_generator._lookup_attention_sample(
+            perf_db,
+            1,
+            0,
+            0,
+            1,
+            16,
+            memory_scenario="input_hbf",
+        )
+        self.assertEqual(attention.latency_ns, 10_000)
+        self.assertEqual(
+            attention.four_way_bytes,
+            {
+                "hbm_read_bytes": 4096,
+                "hbm_write_bytes": 2048,
+                "hbf_read_bytes": 8192,
+                "hbf_write_bytes": 0,
+            },
+        )
+        per_sequence = trace_generator._lookup_per_sequence_sample(
+            perf_db,
+            "lm_head",
+            1,
+            4,
+            memory_scenario="input_hbf",
+        )
+        moe = trace_generator._lookup_moe_sample(
+            perf_db,
+            128,
+            2,
+            memory_scenario="input_hbf",
+        )
+        self.assertEqual(per_sequence.hbm_read_bytes, 4096)
+        self.assertEqual(moe.hbm_write_bytes, 1024)
 
     def test_missing_scenario_is_rejected_before_runtime_lookup(self):
         rows = {
