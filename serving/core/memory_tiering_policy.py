@@ -591,8 +591,20 @@ class TieringPolicyEngine:
             raise TieringPolicyError("admit_kv 只能处理 KV 对象")
         if request.key in self.residency.snapshot().records:
             record = self.residency.record(request.key)
+            if record.state is not ResidencyState.RESIDENT:
+                raise TieringPolicyError("迁移中的 KV 对象不能进入 demand 访问")
             if record.bytes_per_rank != request.bytes_per_rank:
                 raise TieringPolicyError("已登记 KV 对象的字节数不能改变")
+            if (
+                self.config.kv.policy == "hbm_only"
+                and record.tier is not MemoryTier.HBM
+            ):
+                raise TieringPolicyError("hbm_only KV 对象实际不在 HBM")
+            if (
+                self.config.kv.policy == "hbf_only"
+                and record.tier is not MemoryTier.HBF
+            ):
+                raise TieringPolicyError("hbf_only KV 对象实际不在 HBF")
             self.residency.touch(request.key)
             if self.config.kv.policy == "hbm_only":
                 mode = PlacementMode.STATIC_HBM
@@ -839,8 +851,21 @@ class TieringPolicyEngine:
             or hit_count < 0
         ):
             raise ValueError("hit_count 必须是非负整数")
-        record = self.residency.touch(key)
+        record = self.residency.record(key)
+        if record.state is not ResidencyState.RESIDENT:
+            raise TieringPolicyError("迁移中的 Prefix 对象不能进入 demand 访问")
         policy = self.config.prefix
+        if (
+            policy.policy == "hbm_only"
+            and record.tier is not MemoryTier.HBM
+        ):
+            raise TieringPolicyError("hbm_only Prefix 对象实际不在 HBM")
+        if (
+            policy.policy == "hbf_only"
+            and record.tier is not MemoryTier.HBF
+        ):
+            raise TieringPolicyError("hbf_only Prefix 对象实际不在 HBF")
+        record = self.residency.touch(key)
         if (
             policy.policy != "hbf_backed_hbm_hot"
             or record.tier is not MemoryTier.HBF
