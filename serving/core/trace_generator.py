@@ -524,6 +524,9 @@ def _validate_v2_runtime_bundle(
     *,
     model_type,
     model_config,
+    runtime_max_num_batched_tokens=None,
+    runtime_max_num_seqs=None,
+    runtime_block_size=None,
 ):
     """独立核对 manifest 声明与实际架构、目录和查询路径。"""
 
@@ -531,6 +534,20 @@ def _validate_v2_runtime_bundle(
         raise ProfileV2RuntimeNotReadyError(
             "Profile v2 bundle 尚未标记为 runtime_ready"
         )
+    if perf_db.get("runtime_compatible") is not True:
+        raise ProfileV2RuntimeNotReadyError(
+            "Profile v2 bundle 未声明 runtime_compatible=true"
+        )
+    if perf_db.get("scenario_binding") != "producer_verified_v1":
+        raise ProfileV2RuntimeNotReadyError(
+            "Profile v2 bundle 未使用 producer_verified_v1 场景绑定"
+        )
+    _validate_v2_runtime_limits(
+        perf_db,
+        runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
+        runtime_max_num_seqs=runtime_max_num_seqs,
+        runtime_block_size=runtime_block_size,
+    )
     requirements = perf_db.get("architecture_requirements")
     if not isinstance(requirements, dict):
         raise ProfileV2RuntimeNotReadyError(
@@ -631,8 +648,53 @@ def _validate_v2_runtime_bundle(
                 )
 
 
+def _validate_v2_runtime_limits(
+    perf_db,
+    *,
+    runtime_max_num_batched_tokens=None,
+    runtime_max_num_seqs=None,
+    runtime_block_size=None,
+):
+    """Profile v2 不允许运行配置越过生产者验证边界。"""
+
+    engine = perf_db.get("engine_effective")
+    if not isinstance(engine, dict):
+        raise ProfileV2RuntimeNotReadyError(
+            "runtime-ready Profile v2 缺少 engine_effective"
+        )
+    checks = (
+        (
+            "max_num_batched_tokens",
+            runtime_max_num_batched_tokens,
+        ),
+        ("max_num_seqs", runtime_max_num_seqs),
+    )
+    for field, runtime_value in checks:
+        if runtime_value is None:
+            continue
+        runtime_value = int(runtime_value)
+        if runtime_value <= 0:
+            raise ProfileV2RuntimeNotReadyError(
+                f"运行时 {field} 必须是正整数"
+            )
+        if runtime_value > engine[field]:
+            raise ProfileV2RuntimeNotReadyError(
+                f"运行时 {field}={runtime_value} 超过 Profile "
+                f"验证范围 {engine[field]}"
+            )
+    if runtime_block_size is not None:
+        runtime_block_size = int(runtime_block_size)
+        if runtime_block_size != engine["block_size"]:
+            raise ProfileV2RuntimeNotReadyError(
+                f"运行时 block_size={runtime_block_size} 与 Profile "
+                f"block_size={engine['block_size']} 不一致"
+            )
+
+
 def _load_perf_db(hardware, model, variant, tp_needed, model_type,
-                  memory_profile_id=None, model_config=None):
+                  memory_profile_id=None, model_config=None,
+                  runtime_max_num_batched_tokens=None,
+                  runtime_max_num_seqs=None, runtime_block_size=None):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
@@ -651,6 +713,9 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
                 db,
                 model_type=model_type,
                 model_config=model_config,
+                runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
+                runtime_max_num_seqs=runtime_max_num_seqs,
+                runtime_block_size=runtime_block_size,
             )
         return db
 
@@ -775,6 +840,9 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
             perf_db,
             model_type=model_type,
             model_config=model_config,
+            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
+            runtime_max_num_seqs=runtime_max_num_seqs,
+            runtime_block_size=runtime_block_size,
         )
     _perf_db_cache[cache_key] = perf_db
     return perf_db
@@ -1378,6 +1446,13 @@ def _lookup_attention_sample(
     bracket each axis's two nearest profiled values and blend linearly
     in log-space.
     """
+    _validate_v2_attention_query(
+        perf_db,
+        prefill_chunk=prefill_chunk,
+        kv_prefill=kv_prefill,
+        n_decode=n_decode,
+        kv_decode=kv_decode,
+    )
     scenario_tables = _tp_tables(perf_db, tp).get("attention")
     if scenario_tables is None:
         raise KeyError(f"Missing attention profile for tp={tp}.")
@@ -1410,6 +1485,37 @@ def _lookup_attention_sample(
         for column in _FOUR_WAY_AUDIT_COLUMNS
     }
     return _sample_from_components(latency_ns, audit_values)
+
+
+def _validate_v2_attention_query(
+    perf_db,
+    *,
+    prefill_chunk,
+    kv_prefill,
+    n_decode,
+    kv_decode,
+):
+    """拒绝 v2 Attention 查询越过已验证扫描范围。"""
+
+    if not _is_profile_v2(perf_db):
+        return
+    engine = perf_db.get("engine_effective") or {}
+    grid = perf_db.get("attention_grid") or {}
+    limits = (
+        ("prefill_chunk", int(prefill_chunk), engine.get("max_num_batched_tokens")),
+        ("n_decode", int(n_decode), engine.get("max_num_seqs")),
+        ("kv_prefill", int(kv_prefill), grid.get("max_kv")),
+        ("kv_decode", int(kv_decode), grid.get("max_kv")),
+    )
+    for field, value, limit in limits:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ProfileV2RuntimeNotReadyError(
+                f"Profile v2 缺少 {field} 的有效扫描上限"
+            )
+        if value > limit:
+            raise ProfileV2RuntimeNotReadyError(
+                f"Attention {field}={value} 超过 Profile 验证范围 {limit}"
+            )
 
 
 def _lookup_attention_table_value(
@@ -1582,6 +1688,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
+                     runtime_block_size=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                      memory_scenario_policy=None):
     model_type = config.get('model_type')
@@ -1612,6 +1719,9 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             model_type,
             memory_profile_id=memory_scenario_policy.memory_profile_id,
             model_config=config,
+            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
+            runtime_max_num_seqs=runtime_max_num_seqs,
+            runtime_block_size=runtime_block_size,
         )
     else:
         perf_db = _load_perf_db(
@@ -2193,6 +2303,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
+                      runtime_block_size=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                       memory_scenario_policy=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
@@ -2200,6 +2311,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
+                           runtime_block_size=runtime_block_size,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
                            memory_scenario_policy=memory_scenario_policy)
     block_mode_on = bool(
@@ -2252,6 +2364,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
+                                  runtime_block_size=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                                   memory_scenario_policy=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
@@ -2259,6 +2372,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
+                           runtime_block_size=runtime_block_size,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
                            memory_scenario_policy=memory_scenario_policy)
     block_mode_on = bool(
@@ -2368,7 +2482,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
-                   memory_scenario_policy=None):
+                   memory_scenario_policy=None, runtime_block_size=None):
 
     model = batch.model
     config = get_config(model)
@@ -2430,6 +2544,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
+                        runtime_block_size=runtime_block_size,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
                         memory_scenario_policy=memory_scenario_policy)
     if not enable_sub_batch_interleaving:

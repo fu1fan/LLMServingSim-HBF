@@ -151,6 +151,9 @@ class MemoryScenarioRuntimeTest(unittest.TestCase):
             "toy",
             memory_profile_id="cli-a",
             model_config=_model_config(),
+            runtime_max_num_batched_tokens=None,
+            runtime_max_num_seqs=None,
+            runtime_block_size=None,
         )
 
         legacy = parse_instance_performance_profile({}, 2)
@@ -391,6 +394,9 @@ class MemoryScenarioRuntimeTest(unittest.TestCase):
             "toy",
             memory_profile_id="cli-a",
             model_config=_model_config(),
+            runtime_max_num_batched_tokens=2048,
+            runtime_max_num_seqs=None,
+            runtime_block_size=None,
         )
 
     def test_layer_only_policy_preserves_block_copy(self):

@@ -447,6 +447,89 @@ class ProfileV2LookupTest(unittest.TestCase):
         self.assertEqual(per_sequence.hbm_read_bytes, 4096)
         self.assertEqual(moe.hbm_write_bytes, 1024)
 
+    def test_runtime_engine_and_attention_bounds_are_hard_gates(self):
+        rows = {
+            filename: [
+                _row(filename, scenario, 10)
+                for scenario in ("all_hbm", "input_hbf")
+            ]
+            for filename in TABLE_SHAPES
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            profile_id = "runtime-bounds"
+            _write_bundle(
+                _bundle_path(profiler_root, profile_id),
+                profile_id,
+                rows,
+            )
+            with (
+                mock.patch.object(
+                    trace_generator,
+                    "_PROFILER_ROOT_REL",
+                    str(profiler_root),
+                ),
+                mock.patch.object(
+                    trace_generator,
+                    "_load_architecture",
+                    return_value=TOY_ARCHITECTURE,
+                ),
+            ):
+                perf_db = trace_generator._load_perf_db(
+                    "gpu",
+                    "org/model",
+                    "bf16",
+                    {1},
+                    "toy",
+                    memory_profile_id=profile_id,
+                    model_config={"num_experts": 4},
+                    runtime_max_num_batched_tokens=128,
+                    runtime_max_num_seqs=4,
+                    runtime_block_size=16,
+                )
+                with self.assertRaisesRegex(
+                    ProfileV2RuntimeNotReadyError,
+                    "block_size",
+                ):
+                    trace_generator._load_perf_db(
+                        "gpu",
+                        "org/model",
+                        "bf16",
+                        {1},
+                        "toy",
+                        memory_profile_id=profile_id,
+                        model_config={"num_experts": 4},
+                        runtime_block_size=32,
+                    )
+                with self.assertRaisesRegex(
+                    ProfileV2RuntimeNotReadyError,
+                    "max_num_batched_tokens",
+                ):
+                    trace_generator._load_perf_db(
+                        "gpu",
+                        "org/model",
+                        "bf16",
+                        {1},
+                        "toy",
+                        memory_profile_id=profile_id,
+                        model_config={"num_experts": 4},
+                        runtime_max_num_batched_tokens=129,
+                    )
+
+        with self.assertRaisesRegex(
+            ProfileV2RuntimeNotReadyError,
+            "kv_decode",
+        ):
+            trace_generator._lookup_attention(
+                perf_db,
+                1,
+                0,
+                0,
+                1,
+                257,
+                memory_scenario="all_hbm",
+            )
+
     def test_missing_scenario_is_rejected_before_runtime_lookup(self):
         rows = {
             filename: [_row(filename, "all_hbm", 10)]
