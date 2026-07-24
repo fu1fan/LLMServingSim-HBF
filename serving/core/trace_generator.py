@@ -22,6 +22,11 @@ from .memory_scenario import (
     MemoryScenarioPolicy,
     parse_instance_performance_profile,
 )
+from .memory_tiering import MemoryTier
+from .residency_scenario import (
+    BatchMemoryView,
+    ResidencyScenarioResolver,
+)
 import bisect
 from dataclasses import dataclass, field
 
@@ -154,6 +159,8 @@ class TraceCtx:
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
     memory_scenario_policy: object = None
+    memory_view: object = None
+    scenario_resolver: object = None
 
 
 @dataclass
@@ -1651,6 +1658,12 @@ def _validate_policy_against_profile(policy, perf_db):
         raise RuntimeError("memory_scenario_v2 策略必须加载 Profile v2 bundle")
 
     scenario_catalog = perf_db.get("scenario_catalog") or {}
+    if policy.is_residency_derived:
+        if not perf_db.get("access_catalog"):
+            raise RuntimeError(
+                "residency_derived 要求 runtime-ready Profile 提供 access_catalog"
+            )
+        return
     referenced_scenarios = {
         policy.default_scenario,
         *policy.layer_scenarios.values(),
@@ -1677,11 +1690,18 @@ def _validate_policy_against_profile(policy, perf_db):
         )
 
 
-def _scenario_for(ctx, layer_name, layer_num):
-    """统一解析每次 Profile 查询使用的静态场景。"""
+def _scenario_for(ctx, layer_name, layer_num, *, kv_tier=MemoryTier.HBM):
+    """按静态策略或不可变驻留视图解析一次 Profile 查询。"""
     policy = ctx.memory_scenario_policy
     if policy is None:
         return None
+    if policy.is_residency_derived:
+        weight_tier = ctx.memory_view.weight_tier(layer_name, layer_num)
+        return ctx.scenario_resolver.resolve(
+            layer_name,
+            weight_tier=weight_tier,
+            kv_tier=kv_tier,
+        ).scenario_id
     return policy.scenario_for(layer_name, layer_num)
 
 def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
@@ -1690,7 +1710,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      runtime_block_size=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                     memory_scenario_policy=None):
+                     memory_scenario_policy=None, memory_view=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -1732,6 +1752,18 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             model_type,
         )
     _validate_policy_against_profile(memory_scenario_policy, perf_db)
+    scenario_resolver = None
+    if memory_scenario_policy.is_residency_derived:
+        if not isinstance(memory_view, BatchMemoryView):
+            raise TypeError(
+                "residency_derived 必须传入 Scheduler 生成的 BatchMemoryView"
+            )
+        scenario_resolver = ResidencyScenarioResolver(
+            perf_db["access_catalog"],
+            perf_db["scenario_catalog"],
+        )
+    elif memory_view is not None and not isinstance(memory_view, BatchMemoryView):
+        raise TypeError("memory_view 必须是 BatchMemoryView 或 None")
     warn_if_runtime_exceeds_profiled(
         perf_db, runtime_max_num_batched_tokens, runtime_max_num_seqs)
 
@@ -1757,6 +1789,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
         memory_scenario_policy=memory_scenario_policy,
+        memory_view=memory_view,
+        scenario_resolver=scenario_resolver,
     )
 
 
@@ -1800,6 +1834,82 @@ def _build_batch_ctx(batch, ctx):
                     lm_head_len, decode_lens, channel_split)
 
 
+def _attention_residency_groups(ctx, bctx, layer_num):
+    """按 request×layer 的 KV 驻留拆分 Attention 查询。"""
+
+    if not ctx.memory_scenario_policy.is_residency_derived:
+        return ((bctx, MemoryTier.HBM),)
+    if layer_num is None:
+        raise RuntimeError("驻留派生 Attention 必须携带 transformer block 编号")
+    if not bctx.batch.requests:
+        # DP 同步产生的空 dummy 不读取真实 KV。
+        return ((bctx, MemoryTier.HBM),)
+
+    groups = {}
+    prefill_index = 0
+    decode_index = 0
+    for request in bctx.batch.requests:
+        tier = ctx.memory_view.kv_tier(request.id, layer_num)
+        group = groups.setdefault(
+            tier,
+            {"prefill_q": [], "prefill_k": [], "decode_k": []},
+        )
+        if request.is_prefill():
+            try:
+                group["prefill_q"].append(
+                    bctx.batch.prefill_q_list[prefill_index]
+                )
+                group["prefill_k"].append(
+                    bctx.batch.prefill_k_list[prefill_index]
+                )
+            except IndexError as exc:
+                raise RuntimeError(
+                    "Batch 请求顺序与 prefill Attention 轴不一致"
+                ) from exc
+            prefill_index += 1
+        else:
+            try:
+                group["decode_k"].append(
+                    bctx.batch.decode_k_list[decode_index]
+                )
+            except IndexError as exc:
+                raise RuntimeError(
+                    "Batch 请求顺序与 decode Attention 轴不一致"
+                ) from exc
+            decode_index += 1
+
+    if prefill_index != len(bctx.batch.prefill_q_list) or decode_index != len(
+        bctx.batch.decode_k_list
+    ):
+        raise RuntimeError("Batch 请求数量与 Attention 轴长度不一致")
+
+    result = []
+    for tier in sorted(groups, key=lambda item: item.value):
+        group = groups[tier]
+        decode = group["decode_k"]
+        n_decode = len(decode)
+        kv_mean = sum(decode) // n_decode if n_decode else 0
+        result.append(
+            (
+                BatchCtx(
+                    batch=bctx.batch,
+                    total_len=sum(group["prefill_q"]) + n_decode,
+                    prefill_chunk=sum(group["prefill_q"]),
+                    kv_prefill=sum(group["prefill_k"]),
+                    n_decode=n_decode,
+                    kv_decode_mean=kv_mean,
+                    kv_decode_max=max(decode) if decode else 0,
+                    kv_decode_min=min(decode) if decode else 0,
+                    lm_head_len=len(group["prefill_q"]) + n_decode,
+                    decode_lens=None,
+                    channel_split=0,
+                ),
+                tier,
+            )
+        )
+    return tuple(result)
+
+
 # ======================================================================
 # Layer emission helpers
 # ======================================================================
@@ -1826,55 +1936,100 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             f"profiler/models/<model_type>.yaml or remove it from the sequence."
         )
 
-    memory_scenario = _scenario_for(ctx, layer_name, layer_num)
-    if category == "per_sequence":
-        latency_ns = _lookup_per_sequence(
-            ctx.perf_db,
-            layer_name,
-            ctx.tp_size,
-            bctx.lm_head_len,
-            memory_scenario=memory_scenario,
-        )
-    elif category == "attention":
-        latency_ns = _lookup_attention_with_skew(
-            ctx.perf_db, ctx.tp_size,
-            bctx.prefill_chunk, bctx.kv_prefill,
-            bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
-            bctx.kv_decode_min,
-            memory_scenario=memory_scenario,
-        )
-    else:  # dense
-        latency_ns = _lookup_dense(
-            ctx.perf_db,
-            layer_name,
-            ctx.tp_size,
-            bctx.total_len,
-            memory_scenario=memory_scenario,
-        )
-
-    # Size calculation uses the same canonical layer names.
-    if layer_name == 'attention':
-        kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
-        inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
-                                       kv_len=kv_len_for_sizes,
-                                       parallel=ctx.tp_size, fp=ctx.fp)
-    else:
-        inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
-                                       parallel=ctx.tp_size, fp=ctx.fp)
-
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
+    work = (
+        _attention_residency_groups(ctx, bctx, layer_num)
+        if category == "attention"
+        else ((bctx, MemoryTier.HBM),)
+    )
+    total_latency_ns = 0
+    for index, (query_ctx, kv_tier) in enumerate(work):
+        memory_scenario = _scenario_for(
+            ctx,
+            layer_name,
+            layer_num,
+            kv_tier=kv_tier,
+        )
+        if category == "per_sequence":
+            latency_ns = _lookup_per_sequence(
+                ctx.perf_db,
+                layer_name,
+                ctx.tp_size,
+                query_ctx.lm_head_len,
+                memory_scenario=memory_scenario,
+            )
+        elif category == "attention":
+            latency_ns = _lookup_attention_with_skew(
+                ctx.perf_db, ctx.tp_size,
+                query_ctx.prefill_chunk, query_ctx.kv_prefill,
+                query_ctx.n_decode, query_ctx.kv_decode_mean,
+                query_ctx.kv_decode_max, query_ctx.kv_decode_min,
+                memory_scenario=memory_scenario,
+            )
+        else:
+            latency_ns = _lookup_dense(
+                ctx.perf_db,
+                layer_name,
+                ctx.tp_size,
+                query_ctx.total_len,
+                memory_scenario=memory_scenario,
+            )
 
-    lines.append(formatter(layer_name, str(latency_ns), input_loc, str(inp), wt_loc, str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
+        if layer_name == "attention":
+            kv_len = (
+                query_ctx.kv_prefill
+                + query_ctx.n_decode * query_ctx.kv_decode_mean
+            )
+            inp, wt, out = calculate_sizes(
+                ctx.model,
+                layer_name,
+                query_ctx.total_len,
+                kv_len=kv_len,
+                parallel=ctx.tp_size,
+                fp=ctx.fp,
+            )
+        else:
+            inp, wt, out = calculate_sizes(
+                ctx.model,
+                layer_name,
+                query_ctx.total_len,
+                parallel=ctx.tp_size,
+                fp=ctx.fp,
+            )
 
-    if power_acc is not None:
-        power_acc.npu_latencies_ns.append(latency_ns)
-        if wt_loc != 'LOCAL':
-            power_acc.dram_weight_bytes += wt
-        if comm_size > 0:
-            collective = comm_type.split(':', 1)[0].lower()
-            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=collective)
+        # 一次逻辑层拆成多个驻留组时，collective 仍只收取一次。
+        row_comm_type = comm_type if index == len(work) - 1 else "NONE"
+        row_comm_size = comm_size if index == len(work) - 1 else 0
+        lines.append(
+            formatter(
+                layer_name,
+                str(latency_ns),
+                input_loc,
+                str(inp),
+                wt_loc,
+                str(wt),
+                output_loc,
+                str(out),
+                row_comm_type,
+                str(row_comm_size),
+                batch_tag,
+            )
+        )
 
-    return latency_ns
+        total_latency_ns += latency_ns
+        if power_acc is not None:
+            power_acc.npu_latencies_ns.append(latency_ns)
+            if wt_loc != "LOCAL":
+                power_acc.dram_weight_bytes += wt
+            if row_comm_size > 0:
+                collective = row_comm_type.split(":", 1)[0].lower()
+                power_acc.link_data_bytes += total_ring_data(
+                    row_comm_size,
+                    ctx.tp_size,
+                    collective=collective,
+                )
+
+    return total_latency_ns
 
 
 def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
@@ -2305,7 +2460,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       runtime_block_size=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                      memory_scenario_policy=None):
+                      memory_scenario_policy=None, memory_view=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2313,7 +2468,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            runtime_block_size=runtime_block_size,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-                           memory_scenario_policy=memory_scenario_policy)
+                           memory_scenario_policy=memory_scenario_policy,
+                           memory_view=memory_view)
     block_mode_on = bool(
         block_mode_on
         or ctx.memory_scenario_policy.requires_per_block_trace
@@ -2366,7 +2522,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   runtime_block_size=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                                  memory_scenario_policy=None):
+                                  memory_scenario_policy=None, memory_view=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2374,7 +2530,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            runtime_block_size=runtime_block_size,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-                           memory_scenario_policy=memory_scenario_policy)
+                           memory_scenario_policy=memory_scenario_policy,
+                           memory_view=memory_view)
     block_mode_on = bool(
         block_mode_on
         or ctx.memory_scenario_policy.requires_per_block_trace
@@ -2482,7 +2639,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
-                   memory_scenario_policy=None, runtime_block_size=None):
+                   memory_scenario_policy=None, runtime_block_size=None,
+                   memory_view=None):
 
     model = batch.model
     config = get_config(model)
@@ -2546,7 +2704,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_seqs=max_num_seqs,
                         runtime_block_size=runtime_block_size,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-                        memory_scenario_policy=memory_scenario_policy)
+                        memory_scenario_policy=memory_scenario_policy,
+                        memory_view=memory_view)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:
