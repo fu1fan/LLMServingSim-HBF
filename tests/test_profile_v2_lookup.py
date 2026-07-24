@@ -30,10 +30,36 @@ AUDIT_COLUMNS = (
 )
 
 
-def _meta(profile_id, *, skew_enabled=False):
+TOY_ARCHITECTURE = {
+    "sequence": {
+        "prologue": [],
+        "pre_attn": ["qkv_proj", "attention"],
+        "post_attn": [],
+        "mlp_dense": [],
+        "mlp_moe": ["moe"],
+        "head": ["lm_head"],
+    },
+    "catalog": {
+        "dense": {"qkv_proj": {}},
+        "per_sequence": {"lm_head": {}},
+        "attention": {"attention": {}},
+        "moe": {"moe": {}},
+    },
+}
+
+
+def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
     meta = {
         "profile_schema_version": 2,
         "memory_profile_id": profile_id,
+        "tp_degrees": [1],
+        "bundle_readiness": readiness,
+        "runtime_compatible": readiness == "runtime_ready",
+        "scenario_binding": (
+            "producer_verified_v1"
+            if readiness == "runtime_ready"
+            else "caller_asserted"
+        ),
         "scenario_catalog": {
             "all_hbm": {
                 "accesses": {
@@ -63,6 +89,16 @@ def _meta(profile_id, *, skew_enabled=False):
             ],
         },
     }
+    if readiness == "runtime_ready":
+        meta["architecture_requirements"] = {
+            "model_type": "toy",
+            "tp_degrees": [1],
+            "scenario_ids": ["all_hbm", "input_hbf"],
+            "dense_layers": ["qkv_proj"],
+            "per_sequence_layers": ["lm_head"],
+            "attention_required": True,
+            "moe_required": True,
+        }
     if skew_enabled:
         meta["skew_fit"] = {"enabled": True}
     return meta
@@ -81,7 +117,14 @@ def _row(filename, scenario, time_us, **shape_overrides):
     }
 
 
-def _write_bundle(root, profile_id, rows_by_file, *, skew_enabled=False):
+def _write_bundle(
+    root,
+    profile_id,
+    rows_by_file,
+    *,
+    skew_enabled=False,
+    fill_missing=True,
+):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     with (root / "meta.yaml").open("w", encoding="utf-8") as f:
@@ -93,6 +136,17 @@ def _write_bundle(root, profile_id, rows_by_file, *, skew_enabled=False):
 
     tp_dir = root / "tp1"
     tp_dir.mkdir()
+    if fill_missing:
+        rows_by_file = {
+            filename: rows_by_file.get(
+                filename,
+                [
+                    _row(filename, scenario, 10)
+                    for scenario in ("all_hbm", "input_hbf")
+                ],
+            )
+            for filename in TABLE_SHAPES
+        }
     for filename, rows in rows_by_file.items():
         shape_columns = list(TABLE_SHAPES[filename])
         fieldnames = [
@@ -124,14 +178,20 @@ def _bundle_path(profiler_root, profile_id):
 
 
 def _load_v2(profiler_root, profile_id):
-    return trace_generator._load_perf_db(
-        "gpu",
-        "org/model",
-        "bf16",
-        {1},
-        "qwen3_moe",
-        memory_profile_id=profile_id,
-    )
+    with mock.patch.object(
+        trace_generator,
+        "_load_architecture",
+        return_value=TOY_ARCHITECTURE,
+    ):
+        return trace_generator._load_perf_db(
+            "gpu",
+            "org/model",
+            "bf16",
+            {1},
+            "toy",
+            memory_profile_id=profile_id,
+            model_config={"num_experts": 4},
+        )
 
 
 class ProfileV2LookupTest(unittest.TestCase):
@@ -219,9 +279,31 @@ class ProfileV2LookupTest(unittest.TestCase):
                 )
             )
 
-    def test_missing_unknown_and_implicit_scenarios_are_hard_errors(self):
+    def test_missing_scenario_is_rejected_before_runtime_lookup(self):
         rows = {
             filename: [_row(filename, "all_hbm", 10)]
+            for filename in TABLE_SHAPES
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            _write_bundle(_bundle_path(profiler_root, "cli-a"), "cli-a", rows)
+            with mock.patch.object(
+                trace_generator,
+                "_PROFILER_ROOT_REL",
+                str(profiler_root),
+            ):
+                with self.assertRaisesRegex(
+                    ProfileV2RuntimeNotReadyError,
+                    "scenario='input_hbf'",
+                ):
+                    _load_v2(profiler_root, "cli-a")
+
+    def test_unknown_and_implicit_scenarios_are_hard_errors(self):
+        rows = {
+            filename: [
+                _row(filename, "all_hbm", 10),
+                _row(filename, "input_hbf", 30),
+            ]
             for filename in TABLE_SHAPES
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,16 +335,12 @@ class ProfileV2LookupTest(unittest.TestCase):
                 lookup()
             with self.assertRaisesRegex(KeyError, "未知 memory_scenario"):
                 lookup(memory_scenario="not_declared")
-            with self.assertRaisesRegex(KeyError, "Missing"):
-                lookup(memory_scenario="input_hbf")
 
-        with self.assertRaisesRegex(KeyError, "Missing"):
+        self.assertTrue(
             trace_generator._layer_available(
-                perf_db,
-                1,
-                "qkv_proj",
-                memory_scenario="input_hbf",
+                perf_db, 1, "qkv_proj", memory_scenario="input_hbf",
             )
+        )
         with self.assertRaisesRegex(KeyError, "显式提供"):
             trace_generator._layer_available(perf_db, 1, "qkv_proj")
 
@@ -276,6 +354,7 @@ class ProfileV2LookupTest(unittest.TestCase):
                     {
                         "dense.csv": [
                             _row("dense.csv", "all_hbm", time_us),
+                            _row("dense.csv", "input_hbf", time_us),
                         ],
                     },
                 )
@@ -335,23 +414,45 @@ class ProfileV2LookupTest(unittest.TestCase):
                 "org/model",
                 "bf16",
             )
-        with self.assertRaisesRegex(KeyError, "Missing per_sequence"):
+        self.assertTrue(
             trace_generator._layer_available(
                 cli_db,
                 1,
                 "lm_head",
                 memory_scenario="all_hbm",
             )
+        )
+
+        with (
+            mock.patch.object(
+                trace_generator,
+                "_load_architecture",
+                return_value=TOY_ARCHITECTURE,
+            ),
+        ):
+            with self.assertRaisesRegex(FileNotFoundError, "tp=\\[2\\]"):
+                trace_generator._load_perf_db(
+                    "gpu",
+                    "org/model",
+                    "bf16",
+                    {2},
+                    "toy",
+                    memory_profile_id="cli-a",
+                    model_config={"num_experts": 4},
+                )
 
     def test_builder_uses_contract_canonical_scenario_and_layer_text(self):
-        row = _row("dense.csv", " all_hbm ", 10)
-        row["layer"] = " qkv_proj "
+        rows = [
+            _row("dense.csv", " all_hbm ", 10),
+            _row("dense.csv", "input_hbf", 30),
+        ]
+        rows[0]["layer"] = " qkv_proj "
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
             _write_bundle(
                 _bundle_path(profiler_root, "cli-a"),
                 "cli-a",
-                {"dense.csv": [row]},
+                {"dense.csv": rows},
             )
             with mock.patch.object(
                 trace_generator,
@@ -386,6 +487,13 @@ class ProfileV2LookupTest(unittest.TestCase):
                 30,
                 n_decode=2,
                 kv_decode=20,
+            ),
+            _row(
+                "attention.csv",
+                "input_hbf",
+                10,
+                n_decode=2,
+                kv_decode=10,
             ),
         ]
         with tempfile.TemporaryDirectory() as tmp:

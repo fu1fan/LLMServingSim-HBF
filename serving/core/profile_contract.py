@@ -58,13 +58,31 @@ _REQUIRED_ACCOUNTING_EXCLUDES = {
 
 _SCENARIO_MAPPING_KEYS = ("accesses", "access_tiers", "placements")
 
+PROFILE_V2_PARTIAL = "partial"
+PROFILE_V2_RUNTIME_READY = "runtime_ready"
+
+_SCENARIO_BINDING_BY_READINESS = {
+    PROFILE_V2_PARTIAL: "caller_asserted",
+    PROFILE_V2_RUNTIME_READY: "producer_verified_v1",
+}
+
+_ARCHITECTURE_REQUIREMENT_FIELDS = {
+    "model_type",
+    "tp_degrees",
+    "scenario_ids",
+    "dense_layers",
+    "per_sequence_layers",
+    "attention_required",
+    "moe_required",
+}
+
 
 class ProfileContractError(ValueError):
     """Profile bundle 不满足静态契约。"""
 
 
 class ProfileV2RuntimeNotReadyError(RuntimeError):
-    """Profile v2 已通过静态校验，但运行时 scenario 查询尚未接线。"""
+    """Profile v2 已通过静态校验，但不满足运行时完整性门禁。"""
 
 
 @dataclass(frozen=True)
@@ -75,6 +93,11 @@ class ProfileContract:
     memory_profile_id: str | None
     scenario_catalog: Mapping[str, Mapping[str, Any]]
     latency_accounting: Mapping[str, Any]
+    bundle_readiness: str | None
+    runtime_compatible: bool | None
+    scenario_binding: str | None
+    tp_degrees: tuple[int, ...]
+    architecture_requirements: Mapping[str, Any] | None
     meta: Mapping[str, Any]
 
     @property
@@ -137,6 +160,121 @@ def _string_set(value: object, *, field: str) -> set[str]:
     if len(value) != len(set(value)):
         raise ProfileContractError(f"{field} 不得包含重复项")
     return set(value)
+
+
+def _strict_string_list(
+    value: object,
+    *,
+    field: str,
+    allow_empty: bool,
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or (
+        not allow_empty and not value
+    ):
+        suffix = "" if allow_empty else "非空"
+        raise ProfileContractError(f"{field} 必须是{suffix}字符串列表")
+    result = []
+    for item in value:
+        if not isinstance(item, str) or not item or item != item.strip():
+            raise ProfileContractError(
+                f"{field} 的每一项必须是无首尾空白的非空字符串"
+            )
+        result.append(item)
+    if len(result) != len(set(result)):
+        raise ProfileContractError(f"{field} 不得包含重复项")
+    return tuple(result)
+
+
+def _positive_integer_list(
+    value: object,
+    *,
+    field: str,
+) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ProfileContractError(f"{field} 必须是非空正整数列表")
+    result = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise ProfileContractError(f"{field} 必须是非空正整数列表")
+        result.append(item)
+    if len(result) != len(set(result)):
+        raise ProfileContractError(f"{field} 不得包含重复项")
+    return tuple(result)
+
+
+def _validate_architecture_requirements(
+    value: object,
+    *,
+    source: str,
+    tp_degrees: tuple[int, ...],
+    scenario_ids: set[str],
+) -> Mapping[str, Any]:
+    field = f"{source}: architecture_requirements"
+    if not isinstance(value, dict):
+        raise ProfileContractError(f"{field} 必须是 mapping")
+    actual_fields = set(value)
+    if actual_fields != _ARCHITECTURE_REQUIREMENT_FIELDS:
+        missing = sorted(_ARCHITECTURE_REQUIREMENT_FIELDS - actual_fields)
+        extra = sorted(actual_fields - _ARCHITECTURE_REQUIREMENT_FIELDS)
+        details = []
+        if missing:
+            details.append(f"缺少 {', '.join(missing)}")
+        if extra:
+            details.append(f"包含未知字段 {', '.join(extra)}")
+        raise ProfileContractError(f"{field} 字段不完整：{'; '.join(details)}")
+
+    model_type = value["model_type"]
+    if (
+        not isinstance(model_type, str)
+        or not model_type
+        or model_type != model_type.strip()
+    ):
+        raise ProfileContractError(
+            f"{field}.model_type 必须是无首尾空白的非空字符串"
+        )
+    requirement_tps = _positive_integer_list(
+        value["tp_degrees"],
+        field=f"{field}.tp_degrees",
+    )
+    requirement_scenarios = _strict_string_list(
+        value["scenario_ids"],
+        field=f"{field}.scenario_ids",
+        allow_empty=False,
+    )
+    dense_layers = _strict_string_list(
+        value["dense_layers"],
+        field=f"{field}.dense_layers",
+        allow_empty=True,
+    )
+    per_sequence_layers = _strict_string_list(
+        value["per_sequence_layers"],
+        field=f"{field}.per_sequence_layers",
+        allow_empty=True,
+    )
+    for boolean_field in ("attention_required", "moe_required"):
+        if type(value[boolean_field]) is not bool:
+            raise ProfileContractError(
+                f"{field}.{boolean_field} 必须是布尔值"
+            )
+
+    if set(requirement_tps) != set(tp_degrees):
+        raise ProfileContractError(
+            f"{field}.tp_degrees 必须与顶层 tp_degrees 完全一致"
+        )
+    if set(requirement_scenarios) != scenario_ids:
+        raise ProfileContractError(
+            f"{field}.scenario_ids 必须与 scenario_catalog 完全一致"
+        )
+
+    return {
+        "model_type": model_type,
+        "tp_degrees": requirement_tps,
+        "scenario_ids": requirement_scenarios,
+        "dense_layers": dense_layers,
+        "per_sequence_layers": per_sequence_layers,
+        "attention_required": value["attention_required"],
+        "moe_required": value["moe_required"],
+    }
 
 
 def _validate_latency_accounting(
@@ -249,7 +387,15 @@ def validate_profile_meta(
             )
         mixed_fields = sorted(
             key
-            for key in ("memory_profile_id", "scenario_catalog", "latency_accounting")
+            for key in (
+                "memory_profile_id",
+                "scenario_catalog",
+                "latency_accounting",
+                "bundle_readiness",
+                "runtime_compatible",
+                "scenario_binding",
+                "architecture_requirements",
+            )
             if key in meta
         )
         if mixed_fields:
@@ -261,6 +407,11 @@ def validate_profile_meta(
             memory_profile_id=None,
             scenario_catalog={},
             latency_accounting={},
+            bundle_readiness=None,
+            runtime_compatible=None,
+            scenario_binding=None,
+            tp_degrees=(),
+            architecture_requirements=None,
             meta=meta,
         )
 
@@ -286,11 +437,65 @@ def validate_profile_meta(
         meta.get("latency_accounting"),
         source=source,
     )
+    readiness = meta.get("bundle_readiness")
+    if readiness not in _SCENARIO_BINDING_BY_READINESS:
+        raise ProfileContractError(
+            f"{source}: bundle_readiness 必须是 "
+            f"{PROFILE_V2_PARTIAL!r} 或 {PROFILE_V2_RUNTIME_READY!r}"
+        )
+    runtime_compatible = meta.get("runtime_compatible")
+    if type(runtime_compatible) is not bool:
+        raise ProfileContractError(
+            f"{source}: runtime_compatible 必须是布尔值"
+        )
+    expected_compatible = readiness == PROFILE_V2_RUNTIME_READY
+    if runtime_compatible is not expected_compatible:
+        raise ProfileContractError(
+            f"{source}: bundle_readiness={readiness!r} 时 "
+            f"runtime_compatible 必须为 {str(expected_compatible).lower()}"
+        )
+
+    scenario_binding = meta.get("scenario_binding")
+    if not isinstance(scenario_binding, str) or not scenario_binding:
+        raise ProfileContractError(
+            f"{source}: scenario_binding 必须是非空字符串"
+        )
+    expected_binding = _SCENARIO_BINDING_BY_READINESS[readiness]
+    if scenario_binding != expected_binding:
+        raise ProfileContractError(
+            f"{source}: bundle_readiness={readiness!r} 时 "
+            f"scenario_binding 必须是 {expected_binding!r}"
+        )
+
+    tp_degrees = _positive_integer_list(
+        meta.get("tp_degrees"),
+        field=f"{source}: tp_degrees",
+    )
+    requirements_value = meta.get("architecture_requirements")
+    if readiness == PROFILE_V2_PARTIAL:
+        if requirements_value is not None:
+            raise ProfileContractError(
+                f"{source}: partial bundle 不得声明 architecture_requirements"
+            )
+        architecture_requirements = None
+    else:
+        architecture_requirements = _validate_architecture_requirements(
+            requirements_value,
+            source=source,
+            tp_degrees=tp_degrees,
+            scenario_ids=set(catalog),
+        )
+
     return ProfileContract(
         schema_version=version,
         memory_profile_id=manifest_id,
         scenario_catalog=catalog,
         latency_accounting=accounting,
+        bundle_readiness=readiness,
+        runtime_compatible=runtime_compatible,
+        scenario_binding=scenario_binding,
+        tp_degrees=tp_degrees,
+        architecture_requirements=architecture_requirements,
         meta=meta,
     )
 

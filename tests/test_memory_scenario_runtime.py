@@ -150,6 +150,7 @@ class MemoryScenarioRuntimeTest(unittest.TestCase):
             {1},
             "toy",
             memory_profile_id="cli-a",
+            model_config=_model_config(),
         )
 
         legacy = parse_instance_performance_profile({}, 2)
@@ -389,6 +390,7 @@ class MemoryScenarioRuntimeTest(unittest.TestCase):
             {1},
             "toy",
             memory_profile_id="cli-a",
+            model_config=_model_config(),
         )
 
     def test_layer_only_policy_preserves_block_copy(self):

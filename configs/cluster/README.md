@@ -142,6 +142,21 @@ zero-based, bounds-checked, and cannot overlap. A block override forces
 per-block trace construction; layer-only policies may still reuse one
 transformer-block trace.
 
+Profile v2 的静态契约与运行时资格是两层门禁。`bundle_readiness: partial`
+配合 `runtime_compatible: false`、`scenario_binding: caller_asserted` 时，
+`load_profile_contract` 可用于审计文件，但 Serving 运行时会立即拒绝。
+只有生产方完成架构绑定后，才能声明
+`bundle_readiness: runtime_ready`、`runtime_compatible: true` 和
+`scenario_binding: producer_verified_v1`，并提供严格的
+`architecture_requirements`。
+
+运行时不会信任这份自报清单：它会重新读取
+`profiler/models/<model_type>.yaml`，按模型配置选择 Dense 或 MoE 分支，
+再核对活动 sequence、catalog、TP 目录、场景集合以及每条实际查询路径
+的表覆盖。`tp_stable` 层和 MoE 表按 lookup 的真实 effective TP 校验。
+该门禁只证明 bundle 在结构上可执行，不证明采样范围覆盖运行负载，也不
+代表数值已经完成硬件校准。
+
 Profile v2 is incompatible with the legacy demand-access paths below:
 
 - `enable_local_offloading: true`

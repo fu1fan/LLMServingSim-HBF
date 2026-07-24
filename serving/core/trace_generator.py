@@ -12,6 +12,8 @@ from .pim_model import PIMModel
 from .logger import get_logger
 from .run_paths import input_path
 from .profile_contract import (
+    PROFILE_V2_PARTIAL,
+    PROFILE_V2_RUNTIME_READY,
     ProfileV2RuntimeNotReadyError,
     load_profile_contract,
     validate_memory_profile_id,
@@ -396,8 +398,203 @@ def _v2_skew_enabled(meta):
     return bool(skew_profile.get("enabled") or skew_fit.get("enabled"))
 
 
+def _runtime_uses_moe(model_config, architecture):
+    """按运行模型选择实际会执行的 MLP 分支。"""
+
+    sequence = architecture.get("sequence") or {}
+    if model_config is not None:
+        experts = model_config.get(
+            "num_local_experts",
+            model_config.get("num_experts"),
+        )
+        return bool(experts)
+
+    dense_layers = list(sequence.get("mlp_dense") or [])
+    moe_layers = list(sequence.get("mlp_moe") or [])
+    if dense_layers and moe_layers:
+        raise ProfileV2RuntimeNotReadyError(
+            "Profile v2 运行时校验需要 model_config 才能选择 MLP 分支"
+        )
+    return bool(moe_layers)
+
+
+def _active_architecture_layers(architecture, model_config):
+    """从运行时 sequence 派生真正会发起 Profile 查询的层。"""
+
+    sequence = architecture.get("sequence")
+    catalog = architecture.get("catalog")
+    if not isinstance(sequence, dict) or not isinstance(catalog, dict):
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture 必须包含 mapping 类型的 sequence 与 catalog"
+        )
+    categories = ("dense", "per_sequence", "attention", "moe")
+    catalog_sections = {}
+    for category in categories:
+        section = catalog.get(category) or {}
+        if not isinstance(section, dict):
+            raise ProfileV2RuntimeNotReadyError(
+                f"architecture catalog.{category} 必须是 mapping"
+            )
+        catalog_sections[category] = section
+
+    is_moe = _runtime_uses_moe(model_config, architecture)
+    dense_mlp = list(sequence.get("mlp_dense") or [])
+    moe_mlp = list(sequence.get("mlp_moe") or [])
+    if is_moe and not moe_mlp and dense_mlp:
+        raise ProfileV2RuntimeNotReadyError(
+            "模型配置选择 MoE，但 architecture 没有 mlp_moe sequence"
+        )
+    if not is_moe and not dense_mlp and moe_mlp:
+        raise ProfileV2RuntimeNotReadyError(
+            "模型配置选择 Dense，但 architecture 没有 mlp_dense sequence"
+        )
+    active_sections = (
+        "prologue",
+        "pre_attn",
+        "post_attn",
+        "mlp_moe" if is_moe else "mlp_dense",
+        "head",
+    )
+    active_by_category = {category: set() for category in categories}
+    for section_name in active_sections:
+        layers = sequence.get(section_name) or []
+        if not isinstance(layers, list):
+            raise ProfileV2RuntimeNotReadyError(
+                f"architecture sequence.{section_name} 必须是列表"
+            )
+        for layer_name in layers:
+            if not isinstance(layer_name, str) or not layer_name:
+                raise ProfileV2RuntimeNotReadyError(
+                    f"architecture sequence.{section_name} 包含非法层名"
+                )
+            matches = [
+                category
+                for category, entries in catalog_sections.items()
+                if layer_name in entries
+            ]
+            if len(matches) != 1:
+                raise ProfileV2RuntimeNotReadyError(
+                    f"活动层 {layer_name!r} 必须恰好属于一个 catalog 类别，"
+                    f"实际匹配 {matches}"
+                )
+            active_by_category[matches[0]].add(layer_name)
+    return active_by_category
+
+
+def _validate_v2_runtime_bundle(
+    perf_db,
+    *,
+    model_type,
+    model_config,
+):
+    """独立核对 manifest 声明与实际架构、目录和查询路径。"""
+
+    if perf_db.get("bundle_readiness") != PROFILE_V2_RUNTIME_READY:
+        raise ProfileV2RuntimeNotReadyError(
+            "Profile v2 bundle 尚未标记为 runtime_ready"
+        )
+    requirements = perf_db.get("architecture_requirements")
+    if not isinstance(requirements, dict):
+        raise ProfileV2RuntimeNotReadyError(
+            "runtime_ready bundle 缺少 architecture_requirements"
+        )
+    if requirements["model_type"] != model_type:
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.model_type 与运行模型不一致"
+        )
+
+    required_tps = set(requirements["tp_degrees"])
+    available_tps = set(perf_db["available_tps"])
+    if required_tps != available_tps:
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.tp_degrees 与实际 tp<N> 目录不一致"
+        )
+    required_scenarios = set(requirements["scenario_ids"])
+    actual_scenarios = set(perf_db.get("scenario_catalog") or {})
+    if required_scenarios != actual_scenarios:
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.scenario_ids 与 scenario_catalog 不一致"
+        )
+
+    active = _active_architecture_layers(
+        perf_db["architecture"],
+        model_config,
+    )
+    if active["attention"] not in (set(), {"attention"}):
+        raise ProfileV2RuntimeNotReadyError(
+            "活动 attention 层必须使用 canonical 名称 'attention'"
+        )
+    if active["moe"] not in (set(), {"moe"}):
+        raise ProfileV2RuntimeNotReadyError(
+            "活动 MoE 层必须使用 canonical 名称 'moe'"
+        )
+    if set(requirements["dense_layers"]) != active["dense"]:
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.dense_layers 与活动 sequence 不一致"
+        )
+    if set(requirements["per_sequence_layers"]) != active["per_sequence"]:
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.per_sequence_layers 与活动 sequence 不一致"
+        )
+    if requirements["attention_required"] is not bool(active["attention"]):
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.attention_required 与活动 sequence 不一致"
+        )
+    if requirements["moe_required"] is not bool(active["moe"]):
+        raise ProfileV2RuntimeNotReadyError(
+            "architecture_requirements.moe_required 与活动 sequence 不一致"
+        )
+
+    # 只证明查询路径有表；数值扫描范围仍由上层配置另行约束。
+    for tp in sorted(required_tps):
+        for scenario in sorted(required_scenarios):
+            for category in ("dense", "per_sequence"):
+                for layer_name in sorted(active[category]):
+                    effective_tp = _effective_tp(
+                        perf_db,
+                        category,
+                        layer_name,
+                        tp,
+                        scenario,
+                    )
+                    scenario_tables = (
+                        _tp_tables(perf_db, effective_tp)
+                        .get(category, {})
+                        .get(layer_name)
+                    )
+                    if not scenario_tables or scenario not in scenario_tables:
+                        raise ProfileV2RuntimeNotReadyError(
+                            f"缺少 {category} 查询覆盖：layer={layer_name!r}, "
+                            f"tp={effective_tp}, scenario={scenario!r}"
+                        )
+
+            if active["attention"]:
+                attention_tables = (
+                    _tp_tables(perf_db, tp).get("attention") or {}
+                )
+                if scenario not in attention_tables:
+                    raise ProfileV2RuntimeNotReadyError(
+                        f"缺少 attention 查询覆盖：tp={tp}, "
+                        f"scenario={scenario!r}"
+                    )
+
+    if active["moe"]:
+        moe_tp = (
+            1
+            if 1 in perf_db["available_tps"]
+            else perf_db["available_tps"][0]
+        )
+        moe_tables = _tp_tables(perf_db, moe_tp).get("moe") or {}
+        for scenario in sorted(required_scenarios):
+            if scenario not in moe_tables:
+                raise ProfileV2RuntimeNotReadyError(
+                    f"缺少 moe 查询覆盖：tp={moe_tp}, "
+                    f"scenario={scenario!r}"
+                )
+
+
 def _load_perf_db(hardware, model, variant, tp_needed, model_type,
-                  memory_profile_id=None):
+                  memory_profile_id=None, model_config=None):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
@@ -411,6 +608,12 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
     if cache_key in _perf_db_cache:
         db = _perf_db_cache[cache_key]
         _check_tp_coverage(db, tp_needed, hardware, model, variant)
+        if _is_profile_v2(db):
+            _validate_v2_runtime_bundle(
+                db,
+                model_type=model_type,
+                model_config=model_config,
+            )
         return db
 
     root = _profile_root(hardware, model, variant, memory_profile_id)
@@ -430,6 +633,11 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
         root,
         requested_memory_profile_id=memory_profile_id,
     )
+    if contract.is_v2 and contract.bundle_readiness == PROFILE_V2_PARTIAL:
+        raise ProfileV2RuntimeNotReadyError(
+            f"Profile v2 bundle {root} 是 partial，仅可做静态审计，"
+            "不能进入 Serving 运行时"
+        )
     if contract.is_v2 and _v2_skew_enabled(contract.meta):
         # v2 skew 尚无稳定的场景化数据契约，不能复用 v1 的共享 alpha。
         raise ProfileV2RuntimeNotReadyError(
@@ -509,11 +717,19 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
         "profile_schema_version": contract.schema_version,
         "memory_profile_id": contract.memory_profile_id,
         "scenario_catalog": contract.scenario_catalog,
+        "bundle_readiness": contract.bundle_readiness,
+        "architecture_requirements": contract.architecture_requirements,
         "available_tps": sorted(available_tps),
         "tables": tables_per_tp,
     }
-    _perf_db_cache[cache_key] = perf_db
     _check_tp_coverage(perf_db, tp_needed, hardware, model, variant)
+    if contract.is_v2:
+        _validate_v2_runtime_bundle(
+            perf_db,
+            model_type=model_type,
+            model_config=model_config,
+        )
+    _perf_db_cache[cache_key] = perf_db
     return perf_db
 
 
@@ -1181,6 +1397,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             tp_needed,
             model_type,
             memory_profile_id=memory_scenario_policy.memory_profile_id,
+            model_config=config,
         )
     else:
         perf_db = _load_perf_db(

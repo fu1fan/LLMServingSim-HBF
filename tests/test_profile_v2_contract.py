@@ -34,10 +34,53 @@ AUDIT_COLUMNS = (
 )
 
 
-def _v2_meta(profile_id="cli-a"):
+TOY_ARCHITECTURE = {
+    "sequence": {
+        "prologue": [],
+        "pre_attn": ["qkv_proj", "attention"],
+        "post_attn": [],
+        "mlp_dense": [],
+        "mlp_moe": ["moe"],
+        "head": ["lm_head"],
+    },
+    "catalog": {
+        "dense": {"qkv_proj": {}},
+        "per_sequence": {"lm_head": {}},
+        "attention": {"attention": {}},
+        "moe": {"moe": {}},
+    },
+}
+
+
+def _ready_requirements():
     return {
+        "model_type": "toy",
+        "tp_degrees": [1],
+        "scenario_ids": ["all_hbm", "input_hbf"],
+        "dense_layers": ["qkv_proj"],
+        "per_sequence_layers": ["lm_head"],
+        "attention_required": True,
+        "moe_required": True,
+    }
+
+
+def _v2_meta(
+    profile_id="cli-a",
+    *,
+    readiness="partial",
+    requirements=None,
+):
+    meta = {
         "profile_schema_version": 2,
         "memory_profile_id": profile_id,
+        "tp_degrees": [1],
+        "bundle_readiness": readiness,
+        "runtime_compatible": readiness == "runtime_ready",
+        "scenario_binding": (
+            "producer_verified_v1"
+            if readiness == "runtime_ready"
+            else "caller_asserted"
+        ),
         "scenario_catalog": {
             "all_hbm": {
                 "strict": True,
@@ -69,6 +112,13 @@ def _v2_meta(profile_id="cli-a"):
             ],
         },
     }
+    if readiness == "runtime_ready":
+        meta["architecture_requirements"] = (
+            _ready_requirements()
+            if requirements is None
+            else requirements
+        )
+    return meta
 
 
 def _base_row(filename, scenario="all_hbm"):
@@ -159,6 +209,56 @@ class ProfileV2ContractTest(unittest.TestCase):
         self.assertTrue(contract.is_v2)
         self.assertEqual(contract.memory_profile_id, "cli-a")
         self.assertEqual(set(contract.scenario_catalog), {"all_hbm", "input_hbf"})
+        self.assertEqual(contract.bundle_readiness, "partial")
+        self.assertFalse(contract.runtime_compatible)
+        self.assertEqual(contract.scenario_binding, "caller_asserted")
+        self.assertEqual(contract.tp_degrees, (1,))
+        self.assertIsNone(contract.architecture_requirements)
+
+    def test_v2_readiness_fields_are_strict_and_cannot_be_forged(self):
+        cases = {}
+        missing_readiness = _v2_meta()
+        missing_readiness.pop("bundle_readiness")
+        cases["missing readiness"] = missing_readiness
+
+        incompatible_partial = _v2_meta()
+        incompatible_partial["runtime_compatible"] = True
+        cases["partial claims compatible"] = incompatible_partial
+
+        forged_binding = _v2_meta(readiness="runtime_ready")
+        forged_binding["scenario_binding"] = "caller_asserted"
+        cases["ready keeps caller binding"] = forged_binding
+
+        partial_requirements = _v2_meta()
+        partial_requirements["architecture_requirements"] = _ready_requirements()
+        cases["partial claims requirements"] = partial_requirements
+
+        duplicate_tp = _v2_meta()
+        duplicate_tp["tp_degrees"] = [1, 1]
+        cases["duplicate tp"] = duplicate_tp
+
+        extra_requirement = _ready_requirements()
+        extra_requirement["unknown"] = []
+        cases["unknown requirement field"] = _v2_meta(
+            readiness="runtime_ready",
+            requirements=extra_requirement,
+        )
+
+        bool_tp = _ready_requirements()
+        bool_tp["tp_degrees"] = [True]
+        cases["bool tp"] = _v2_meta(
+            readiness="runtime_ready",
+            requirements=bool_tp,
+        )
+
+        for name, meta in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ProfileContractError):
+                    validate_profile_meta(
+                        meta,
+                        requested_memory_profile_id="cli-a",
+                        source="meta.yaml",
+                    )
 
     def test_v2_requires_explicit_matching_identity(self):
         meta = _v2_meta("cli-a")
@@ -346,7 +446,7 @@ class ProfileV2ContractTest(unittest.TestCase):
             ("gpu", "model", "bf16", "cli-a"),
         )
 
-    def test_runtime_load_accepts_valid_v2_lookup_bundle(self):
+    def test_partial_is_statically_valid_but_runtime_rejects_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
             bundle = (
@@ -360,35 +460,294 @@ class ProfileV2ContractTest(unittest.TestCase):
             )
             _make_v2_bundle(bundle, filenames=("dense.csv",))
 
+            contract = load_profile_contract(
+                str(bundle),
+                requested_memory_profile_id="cli-a",
+            )
+            self.assertEqual(contract.bundle_readiness, "partial")
+
             with mock.patch.object(
                 trace_generator,
                 "_PROFILER_ROOT_REL",
                 str(profiler_root),
+            ):
+                with self.assertRaisesRegex(
+                    trace_generator.ProfileV2RuntimeNotReadyError,
+                    "partial",
+                ):
+                    trace_generator._load_perf_db(
+                        "gpu",
+                        "org/model",
+                        "bf16",
+                        {1},
+                        "toy",
+                        memory_profile_id="cli-a",
+                        model_config={"num_experts": 4},
+                    )
+
+        self.assertNotIn(
+            ("gpu", "org/model", "bf16", "cli-a"),
+            trace_generator._perf_db_cache,
+        )
+
+    def test_complete_toy_runtime_ready_bundle_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            bundle = (
+                profiler_root
+                / "perf"
+                / "gpu"
+                / "org"
+                / "model"
+                / "bf16"
+                / "cli-a"
+            )
+            rows = {
+                filename: [
+                    _base_row(filename, scenario)
+                    for scenario in ("all_hbm", "input_hbf")
+                ]
+                for filename in TABLE_COLUMNS
+            }
+            _make_v2_bundle(
+                bundle,
+                rows_by_file=rows,
+                meta=_v2_meta(readiness="runtime_ready"),
+            )
+            architecture_path = Path(tmp) / "models" / "toy.yaml"
+            _write_yaml(architecture_path, TOY_ARCHITECTURE)
+
+            with (
+                mock.patch.object(
+                    trace_generator,
+                    "_PROFILER_ROOT_REL",
+                    str(profiler_root),
+                ),
+                mock.patch.object(
+                    trace_generator,
+                    "_arch_yaml_path",
+                    return_value=str(architecture_path),
+                ),
             ):
                 perf_db = trace_generator._load_perf_db(
                     "gpu",
                     "org/model",
                     "bf16",
                     {1},
-                    "llama",
+                    "toy",
                     memory_profile_id="cli-a",
+                    model_config={"num_experts": 4},
                 )
 
-        self.assertEqual(perf_db["profile_schema_version"], 2)
+        self.assertEqual(perf_db["bundle_readiness"], "runtime_ready")
         self.assertIn(
             ("gpu", "org/model", "bf16", "cli-a"),
             trace_generator._perf_db_cache,
         )
-        self.assertEqual(
-            trace_generator._lookup_dense(
-                perf_db,
-                "qkv_proj",
-                1,
-                128,
-                memory_scenario="all_hbm",
-            ),
-            12500,
+
+    def test_runtime_rejects_requirements_that_omit_active_sequence_layer(self):
+        forged_requirements = _ready_requirements()
+        forged_architecture = {
+            "sequence": {
+                **TOY_ARCHITECTURE["sequence"],
+                "pre_attn": ["qkv_proj", "rotary_emb", "attention"],
+            },
+            "catalog": {
+                **TOY_ARCHITECTURE["catalog"],
+                "dense": {
+                    "qkv_proj": {},
+                    "rotary_emb": {},
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            bundle = (
+                profiler_root / "perf" / "gpu" / "org" / "model"
+                / "bf16" / "cli-a"
+            )
+            rows = {
+                filename: [
+                    _base_row(filename, scenario)
+                    for scenario in ("all_hbm", "input_hbf")
+                ]
+                for filename in TABLE_COLUMNS
+            }
+            _make_v2_bundle(
+                bundle,
+                rows_by_file=rows,
+                meta=_v2_meta(
+                    readiness="runtime_ready",
+                    requirements=forged_requirements,
+                ),
+            )
+
+            with (
+                mock.patch.object(
+                    trace_generator,
+                    "_PROFILER_ROOT_REL",
+                    str(profiler_root),
+                ),
+                mock.patch.object(
+                    trace_generator,
+                    "_load_architecture",
+                    return_value=forged_architecture,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    trace_generator.ProfileV2RuntimeNotReadyError,
+                    "dense_layers",
+                ):
+                    trace_generator._load_perf_db(
+                        "gpu",
+                        "org/model",
+                        "bf16",
+                        {1},
+                        "toy",
+                        memory_profile_id="cli-a",
+                        model_config={"num_experts": 4},
+                    )
+
+    def test_runtime_rejects_model_config_and_mlp_sequence_mismatch(self):
+        with self.assertRaisesRegex(
+            trace_generator.ProfileV2RuntimeNotReadyError,
+            "选择 Dense",
+        ):
+            trace_generator._active_architecture_layers(
+                TOY_ARCHITECTURE,
+                {},
+            )
+
+    def test_runtime_rejects_missing_required_category_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            bundle = (
+                profiler_root / "perf" / "gpu" / "org" / "model"
+                / "bf16" / "cli-a"
+            )
+            dense_rows = [
+                _base_row("dense.csv", scenario)
+                for scenario in ("all_hbm", "input_hbf")
+            ]
+            _make_v2_bundle(
+                bundle,
+                filenames=("dense.csv",),
+                rows_by_file={"dense.csv": dense_rows},
+                meta=_v2_meta(readiness="runtime_ready"),
+            )
+
+            with (
+                mock.patch.object(
+                    trace_generator,
+                    "_PROFILER_ROOT_REL",
+                    str(profiler_root),
+                ),
+                mock.patch.object(
+                    trace_generator,
+                    "_load_architecture",
+                    return_value=TOY_ARCHITECTURE,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    trace_generator.ProfileV2RuntimeNotReadyError,
+                    "per_sequence",
+                ):
+                    trace_generator._load_perf_db(
+                        "gpu",
+                        "org/model",
+                        "bf16",
+                        {1},
+                        "toy",
+                        memory_profile_id="cli-a",
+                        model_config={"num_experts": 4},
+                    )
+
+    def test_tp_stable_and_moe_follow_their_real_effective_tp(self):
+        architecture = {
+            "sequence": {
+                "prologue": [],
+                "pre_attn": ["qkv_proj"],
+                "post_attn": [],
+                "mlp_dense": [],
+                "mlp_moe": ["moe"],
+                "head": [],
+            },
+            "catalog": {
+                "dense": {"qkv_proj": {"tp_stable": True}, "unused": {}},
+                "per_sequence": {},
+                "attention": {},
+                "moe": {"moe": {}},
+            },
+        }
+        requirements = {
+            "model_type": "toy",
+            "tp_degrees": [1, 2],
+            "scenario_ids": ["all_hbm", "input_hbf"],
+            "dense_layers": ["qkv_proj"],
+            "per_sequence_layers": [],
+            "attention_required": False,
+            "moe_required": True,
+        }
+        meta = _v2_meta(
+            readiness="runtime_ready",
+            requirements=requirements,
         )
+        meta["tp_degrees"] = [1, 2]
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler_root = Path(tmp) / "profiler"
+            bundle = (
+                profiler_root / "perf" / "gpu" / "org" / "model"
+                / "bf16" / "cli-a"
+            )
+            _write_yaml(bundle / "meta.yaml", meta)
+            for filename in ("dense.csv", "moe.csv"):
+                _write_csv(
+                    bundle / "tp1" / filename,
+                    filename,
+                    [
+                        _base_row(filename, scenario)
+                        for scenario in ("all_hbm", "input_hbf")
+                    ],
+                )
+            unused_rows = []
+            for scenario in ("all_hbm", "input_hbf"):
+                row = _base_row("dense.csv", scenario)
+                row["layer"] = "unused"
+                unused_rows.append(row)
+            _write_csv(
+                bundle / "tp2" / "dense.csv",
+                "dense.csv",
+                unused_rows,
+            )
+
+            with (
+                mock.patch.object(
+                    trace_generator,
+                    "_PROFILER_ROOT_REL",
+                    str(profiler_root),
+                ),
+                mock.patch.object(
+                    trace_generator,
+                    "_load_architecture",
+                    return_value=architecture,
+                ),
+            ):
+                perf_db = trace_generator._load_perf_db(
+                    "gpu",
+                    "org/model",
+                    "bf16",
+                    {2},
+                    "toy",
+                    memory_profile_id="cli-a",
+                    model_config={"num_experts": 4},
+                )
+
+        self.assertEqual(perf_db["available_tps"], [1, 2])
+        self.assertNotIn(
+            "qkv_proj",
+            perf_db["tables"][2]["dense"],
+        )
+        self.assertNotIn("moe", perf_db["tables"][2])
 
     def test_legacy_v1_runtime_load_and_cache_key_remain_usable(self):
         with tempfile.TemporaryDirectory() as tmp:
