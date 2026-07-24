@@ -282,6 +282,46 @@ class ProfileV2ContractTest(unittest.TestCase):
         self.assertEqual(contract.tp_degrees, (1,))
         self.assertIsNone(contract.architecture_requirements)
 
+    def test_json_meta_preserves_scientific_notation_identity(self):
+        meta = _v2_meta(
+            "json-scientific",
+            readiness="runtime_ready",
+        )
+        identity = meta["performance_identity"]["manifest"]
+        identity["hardware"]["parameters"]["latency_second"] = 1e-6
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        meta["performance_identity"]["digest"] = hashlib.sha256(
+            encoded
+        ).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_v2_bundle(
+                Path(tmp) / "bundle",
+                profile_id="json-scientific",
+                meta=meta,
+            )
+            (root / "meta.yaml").write_text(
+                json.dumps(meta),
+                encoding="utf-8",
+            )
+
+            contract = load_profile_contract(
+                str(root),
+                requested_memory_profile_id="json-scientific",
+            )
+
+        self.assertEqual(
+            contract.performance_identity["manifest"]["hardware"][
+                "parameters"
+            ]["latency_second"],
+            1e-6,
+        )
+
     def test_v2_readiness_fields_are_strict_and_cannot_be_forged(self):
         cases = {}
         missing_readiness = _v2_meta()

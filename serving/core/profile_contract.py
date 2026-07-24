@@ -155,11 +155,19 @@ def _read_meta(profile_root: str) -> Mapping[str, Any]:
         raise ProfileContractError(f"Profile manifest 不存在：{path}")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            meta = yaml.safe_load(f)
-    except yaml.YAMLError as exc:
-        raise ProfileContractError(f"无法解析 Profile manifest {path}：{exc}") from exc
+            content = f.read()
     except OSError as exc:
         raise ProfileContractError(f"无法读取 Profile manifest {path}：{exc}") from exc
+    try:
+        # LLMCompass 输出规范 JSON；优先按 JSON 解析以保留科学计数法的数值类型。
+        meta = json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            meta = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            raise ProfileContractError(
+                f"无法解析 Profile manifest {path}：{exc}"
+            ) from exc
     if not isinstance(meta, dict):
         raise ProfileContractError(f"Profile manifest {path} 的顶层必须是 mapping")
     return meta
