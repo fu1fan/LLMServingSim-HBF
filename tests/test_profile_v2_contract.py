@@ -67,6 +67,21 @@ def _ready_requirements():
     }
 
 
+def _runtime_access_catalog():
+    return {
+        "op/input": {
+            "semantic": "activation",
+            "access_type": "read",
+            "lifetime": "iteration",
+        },
+        "op/output": {
+            "semantic": "output",
+            "access_type": "write",
+            "lifetime": "iteration",
+        },
+    }
+
+
 def _v2_meta(
     profile_id="cli-a",
     *,
@@ -121,7 +136,11 @@ def _v2_meta(
             if requirements is None
             else requirements
         )
-        _attach_runtime_metadata(meta)
+        digest = _attach_runtime_metadata(
+            meta,
+            _runtime_access_catalog(),
+        )
+        meta["memory_profile_id"] = f"{profile_id}-{digest[:16]}"
     return meta
 
 
@@ -263,6 +282,8 @@ class ProfileV2ContractTest(unittest.TestCase):
         self.assertEqual(contract.schema_version, 1)
         self.assertFalse(contract.is_v2)
         self.assertIsNone(contract.memory_profile_id)
+        self.assertEqual(contract.access_catalog, {})
+        self.assertIsNone(contract.performance_identity)
 
     def test_valid_v2_bundle_validates_every_category(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +302,8 @@ class ProfileV2ContractTest(unittest.TestCase):
         self.assertEqual(contract.scenario_binding, "caller_asserted")
         self.assertEqual(contract.tp_degrees, (1,))
         self.assertIsNone(contract.architecture_requirements)
+        self.assertEqual(contract.access_catalog, {})
+        self.assertIsNone(contract.performance_identity)
 
     def test_json_meta_preserves_scientific_notation_identity(self):
         meta = _v2_meta(
@@ -298,11 +321,14 @@ class ProfileV2ContractTest(unittest.TestCase):
         meta["performance_identity"]["digest"] = hashlib.sha256(
             encoded
         ).hexdigest()
+        meta["memory_profile_id"] = (
+            "json-scientific-"
+            f"{meta['performance_identity']['digest'][:16]}"
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_v2_bundle(
                 Path(tmp) / "bundle",
-                profile_id="json-scientific",
                 meta=meta,
             )
             (root / "meta.yaml").write_text(
@@ -312,7 +338,7 @@ class ProfileV2ContractTest(unittest.TestCase):
 
             contract = load_profile_contract(
                 str(root),
-                requested_memory_profile_id="json-scientific",
+                requested_memory_profile_id=meta["memory_profile_id"],
             )
 
         self.assertEqual(
@@ -363,23 +389,14 @@ class ProfileV2ContractTest(unittest.TestCase):
                 with self.assertRaises(ProfileContractError):
                     validate_profile_meta(
                         meta,
-                        requested_memory_profile_id="cli-a",
+                        requested_memory_profile_id=meta[
+                            "memory_profile_id"
+                        ],
                         source="meta.yaml",
                     )
 
     def test_runtime_ready_metadata_and_access_catalog_are_verified(self):
-        access_catalog = {
-            "op/input": {
-                "semantic": "activation",
-                "access_type": "read",
-                "lifetime": "iteration",
-            },
-            "op/output": {
-                "semantic": "output",
-                "access_type": "write",
-                "lifetime": "iteration",
-            },
-        }
+        access_catalog = _runtime_access_catalog()
         meta = _v2_meta(readiness="runtime_ready")
         digest = _attach_runtime_metadata(meta, access_catalog)
         profile_id = f"test-gpu-cli-{digest[:16]}"
@@ -422,13 +439,41 @@ class ProfileV2ContractTest(unittest.TestCase):
             "access_catalog"
         ]["op/input"]["semantic"] = "weight"
         cases["forged identity"] = forged_identity
+        missing_catalog = copy.deepcopy(meta)
+        missing_catalog.pop("access_catalog")
+        cases["missing access catalog"] = missing_catalog
+        old_schema = copy.deepcopy(meta)
+        old_identity = old_schema["performance_identity"]["manifest"]
+        old_identity["identity_schema"] = (
+            "llmcompass_profile_v2_performance_identity_v1"
+        )
+        old_digest = hashlib.sha256(
+            json.dumps(
+                old_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        old_schema["performance_identity"]["digest"] = old_digest
+        old_schema["memory_profile_id"] = (
+            f"test-gpu-cli-{old_digest[:16]}"
+        )
+        cases["old identity schema"] = old_schema
+        changed_scenario = copy.deepcopy(meta)
+        changed_scenario["scenario_catalog"]["all_hbm"]["accesses"][
+            "op/input"
+        ] = "hbf"
+        cases["scenario outside identity"] = changed_scenario
 
         for name, invalid_meta in cases.items():
             with self.subTest(name=name):
                 with self.assertRaises(ProfileContractError):
                     validate_profile_meta(
                         invalid_meta,
-                        requested_memory_profile_id=profile_id,
+                        requested_memory_profile_id=invalid_meta[
+                            "memory_profile_id"
+                        ],
                         source="meta.yaml",
                     )
 
@@ -665,6 +710,8 @@ class ProfileV2ContractTest(unittest.TestCase):
     def test_complete_toy_runtime_ready_bundle_loads(self):
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
+            meta = _v2_meta(readiness="runtime_ready")
+            profile_id = meta["memory_profile_id"]
             bundle = (
                 profiler_root
                 / "perf"
@@ -672,7 +719,7 @@ class ProfileV2ContractTest(unittest.TestCase):
                 / "org"
                 / "model"
                 / "bf16"
-                / "cli-a"
+                / profile_id
             )
             rows = {
                 filename: [
@@ -684,7 +731,7 @@ class ProfileV2ContractTest(unittest.TestCase):
             _make_v2_bundle(
                 bundle,
                 rows_by_file=rows,
-                meta=_v2_meta(readiness="runtime_ready"),
+                meta=meta,
             )
             architecture_path = Path(tmp) / "models" / "toy.yaml"
             _write_yaml(architecture_path, TOY_ARCHITECTURE)
@@ -707,7 +754,7 @@ class ProfileV2ContractTest(unittest.TestCase):
                     "bf16",
                     {1},
                     "toy",
-                    memory_profile_id="cli-a",
+                    memory_profile_id=profile_id,
                     model_config={"num_experts": 4},
                 )
 
@@ -726,8 +773,12 @@ class ProfileV2ContractTest(unittest.TestCase):
             },
         )
         self.assertEqual(perf_db["memory_integration"]["mode"], "cli")
+        self.assertEqual(
+            perf_db["access_catalog"],
+            _runtime_access_catalog(),
+        )
         self.assertIn(
-            ("gpu", "org/model", "bf16", "cli-a"),
+            ("gpu", "org/model", "bf16", profile_id),
             trace_generator._perf_db_cache,
         )
 
@@ -748,9 +799,14 @@ class ProfileV2ContractTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
+            meta = _v2_meta(
+                readiness="runtime_ready",
+                requirements=forged_requirements,
+            )
+            profile_id = meta["memory_profile_id"]
             bundle = (
                 profiler_root / "perf" / "gpu" / "org" / "model"
-                / "bf16" / "cli-a"
+                / "bf16" / profile_id
             )
             rows = {
                 filename: [
@@ -762,10 +818,7 @@ class ProfileV2ContractTest(unittest.TestCase):
             _make_v2_bundle(
                 bundle,
                 rows_by_file=rows,
-                meta=_v2_meta(
-                    readiness="runtime_ready",
-                    requirements=forged_requirements,
-                ),
+                meta=meta,
             )
 
             with (
@@ -790,7 +843,7 @@ class ProfileV2ContractTest(unittest.TestCase):
                         "bf16",
                         {1},
                         "toy",
-                        memory_profile_id="cli-a",
+                        memory_profile_id=profile_id,
                         model_config={"num_experts": 4},
                     )
 
@@ -807,9 +860,11 @@ class ProfileV2ContractTest(unittest.TestCase):
     def test_runtime_rejects_missing_required_category_table(self):
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
+            meta = _v2_meta(readiness="runtime_ready")
+            profile_id = meta["memory_profile_id"]
             bundle = (
                 profiler_root / "perf" / "gpu" / "org" / "model"
-                / "bf16" / "cli-a"
+                / "bf16" / profile_id
             )
             dense_rows = [
                 _base_row("dense.csv", scenario)
@@ -819,7 +874,7 @@ class ProfileV2ContractTest(unittest.TestCase):
                 bundle,
                 filenames=("dense.csv",),
                 rows_by_file={"dense.csv": dense_rows},
-                meta=_v2_meta(readiness="runtime_ready"),
+                meta=meta,
             )
 
             with (
@@ -844,7 +899,7 @@ class ProfileV2ContractTest(unittest.TestCase):
                         "bf16",
                         {1},
                         "toy",
-                        memory_profile_id="cli-a",
+                        memory_profile_id=profile_id,
                         model_config={"num_experts": 4},
                     )
 
@@ -879,11 +934,12 @@ class ProfileV2ContractTest(unittest.TestCase):
             requirements=requirements,
         )
         meta["tp_degrees"] = [1, 2]
+        profile_id = meta["memory_profile_id"]
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
             bundle = (
                 profiler_root / "perf" / "gpu" / "org" / "model"
-                / "bf16" / "cli-a"
+                / "bf16" / profile_id
             )
             _write_yaml(bundle / "meta.yaml", meta)
             for filename in ("dense.csv", "moe.csv"):
@@ -924,7 +980,7 @@ class ProfileV2ContractTest(unittest.TestCase):
                     "bf16",
                     {2},
                     "toy",
-                    memory_profile_id="cli-a",
+                    memory_profile_id=profile_id,
                     model_config={"num_experts": 4},
                 )
 

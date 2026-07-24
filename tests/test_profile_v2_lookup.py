@@ -31,6 +31,19 @@ AUDIT_COLUMNS = (
     "hbf_write_bytes",
 )
 
+ACCESS_CATALOG = {
+    "op/input": {
+        "semantic": "activation",
+        "access_type": "read",
+        "lifetime": "iteration",
+    },
+    "op/output": {
+        "semantic": "output",
+        "access_type": "write",
+        "lifetime": "iteration",
+    },
+}
+
 
 TOY_ARCHITECTURE = {
     "sequence": {
@@ -104,8 +117,8 @@ def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
         calibration_digest = "a" * 64
         memory_integration = {"mode": "cli", "parameters": {}}
         identity = {
-            "identity_schema": "llmcompass_profile_v2_performance_identity_v1",
-            "hardware": {"hardware_id": "test-gpu", "parameters": {}},
+            "identity_schema": "llmcompass_profile_v2_performance_identity_v2",
+            "hardware": {"hardware_id": profile_id, "parameters": {}},
             "memory_integration": memory_integration,
             "traffic_resolver": {
                 "model_id": "test-resolver",
@@ -118,6 +131,7 @@ def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
                 },
             },
             "scenario_catalog": meta["scenario_catalog"],
+            "access_catalog": ACCESS_CATALOG,
         }
         digest = hashlib.sha256(
             json.dumps(
@@ -139,6 +153,7 @@ def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
                     "hbf": "parameterized_projection",
                 },
                 "memory_integration": memory_integration,
+                "access_catalog": ACCESS_CATALOG,
                 "engine_effective": {
                     "max_num_batched_tokens": 128,
                     "max_num_seqs": 4,
@@ -156,6 +171,7 @@ def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
                 },
             }
         )
+        meta["memory_profile_id"] = f"{profile_id}-{digest[:16]}"
     if skew_enabled:
         meta["skew_fit"] = {"enabled": True}
     return meta
@@ -233,8 +249,12 @@ def _bundle_path(profiler_root, profile_id):
         / "org"
         / "model"
         / "bf16"
-        / profile_id
+        / _runtime_profile_id(profile_id)
     )
+
+
+def _runtime_profile_id(profile_id):
+    return _meta(profile_id)["memory_profile_id"]
 
 
 def _load_v2(profiler_root, profile_id):
@@ -249,7 +269,7 @@ def _load_v2(profiler_root, profile_id):
             "bf16",
             {1},
             "toy",
-            memory_profile_id=profile_id,
+            memory_profile_id=_runtime_profile_id(profile_id),
             model_config={"num_experts": 4},
         )
 
@@ -481,7 +501,7 @@ class ProfileV2LookupTest(unittest.TestCase):
                     "bf16",
                     {1},
                     "toy",
-                    memory_profile_id=profile_id,
+                    memory_profile_id=_runtime_profile_id(profile_id),
                     model_config={"num_experts": 4},
                     runtime_max_num_batched_tokens=128,
                     runtime_max_num_seqs=4,
@@ -497,7 +517,7 @@ class ProfileV2LookupTest(unittest.TestCase):
                         "bf16",
                         {1},
                         "toy",
-                        memory_profile_id=profile_id,
+                        memory_profile_id=_runtime_profile_id(profile_id),
                         model_config={"num_experts": 4},
                         runtime_block_size=32,
                     )
@@ -511,7 +531,7 @@ class ProfileV2LookupTest(unittest.TestCase):
                         "bf16",
                         {1},
                         "toy",
-                        memory_profile_id=profile_id,
+                        memory_profile_id=_runtime_profile_id(profile_id),
                         model_config={"num_experts": 4},
                         runtime_max_num_batched_tokens=129,
                     )
@@ -619,12 +639,14 @@ class ProfileV2LookupTest(unittest.TestCase):
                 csi_db = _load_v2(profiler_root, "csi-b")
 
         self.assertIsNot(cli_db, csi_db)
+        cli_profile_id = _runtime_profile_id("cli-a")
+        csi_profile_id = _runtime_profile_id("csi-b")
         self.assertIn(
-            ("gpu", "org/model", "bf16", "cli-a"),
+            ("gpu", "org/model", "bf16", cli_profile_id),
             trace_generator._perf_db_cache,
         )
         self.assertIn(
-            ("gpu", "org/model", "bf16", "csi-b"),
+            ("gpu", "org/model", "bf16", csi_profile_id),
             trace_generator._perf_db_cache,
         )
         self.assertEqual(
@@ -650,14 +672,14 @@ class ProfileV2LookupTest(unittest.TestCase):
         trace_generator.warn_if_runtime_exceeds_profiled(cli_db, None, None)
         trace_generator.warn_if_runtime_exceeds_profiled(csi_db, None, None)
         self.assertIn(
-            ("warned", "gpu", "org/model", "bf16", "cli-a"),
+            ("warned", "gpu", "org/model", "bf16", cli_profile_id),
             trace_generator._perf_db_cache,
         )
         self.assertIn(
-            ("warned", "gpu", "org/model", "bf16", "csi-b"),
+            ("warned", "gpu", "org/model", "bf16", csi_profile_id),
             trace_generator._perf_db_cache,
         )
-        with self.assertRaisesRegex(FileNotFoundError, "bf16/cli-a/"):
+        with self.assertRaisesRegex(FileNotFoundError, "bf16/cli-a-"):
             trace_generator._check_tp_coverage(
                 cli_db,
                 {2},
@@ -688,7 +710,7 @@ class ProfileV2LookupTest(unittest.TestCase):
                     "bf16",
                     {2},
                     "toy",
-                    memory_profile_id="cli-a",
+                    memory_profile_id=cli_profile_id,
                     model_config={"num_experts": 4},
                 )
 

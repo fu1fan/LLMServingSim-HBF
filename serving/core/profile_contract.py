@@ -514,29 +514,27 @@ def _validate_runtime_ready_metadata(
         source=source,
     )
 
-    access_catalog_value = meta.get("access_catalog")
-    access_catalog = (
-        {}
-        if access_catalog_value is None
-        else _validate_access_catalog(access_catalog_value, source=source)
+    access_catalog = _validate_access_catalog(
+        meta.get("access_catalog"),
+        source=source,
     )
-    if access_catalog:
-        access_keys = set(access_catalog)
-        for scenario_id, declaration in scenario_catalog.items():
-            mapping_key = next(
-                key for key in _SCENARIO_MAPPING_KEYS if key in declaration
+    access_keys = set(access_catalog)
+    for scenario_id, declaration in scenario_catalog.items():
+        mapping_key = next(
+            key for key in _SCENARIO_MAPPING_KEYS if key in declaration
+        )
+        if set(declaration[mapping_key]) != access_keys:
+            raise ProfileContractError(
+                f"{source}: scenario_catalog.{scenario_id}.{mapping_key} "
+                "必须完整覆盖 access_catalog"
             )
-            if set(declaration[mapping_key]) != access_keys:
-                raise ProfileContractError(
-                    f"{source}: scenario_catalog.{scenario_id}.{mapping_key} "
-                    "必须完整覆盖 access_catalog"
-                )
 
     performance_identity = _validate_performance_identity(
         meta.get("performance_identity"),
         source=source,
         manifest_id=manifest_id,
         memory_integration=memory_integration,
+        scenario_catalog=scenario_catalog,
         access_catalog=access_catalog,
         calibration_digest=calibration_digest,
     )
@@ -627,6 +625,7 @@ def _validate_performance_identity(
     source: str,
     manifest_id: str,
     memory_integration: Mapping[str, Any],
+    scenario_catalog: Mapping[str, Mapping[str, Any]],
     access_catalog: Mapping[str, Mapping[str, str]],
     calibration_digest: str,
 ) -> Mapping[str, Any]:
@@ -664,6 +663,10 @@ def _validate_performance_identity(
         raise ProfileContractError(
             f"{field}.manifest.memory_integration 与顶层声明不一致"
         )
+    if identity.get("scenario_catalog") != scenario_catalog:
+        raise ProfileContractError(
+            f"{field}.manifest.scenario_catalog 与顶层声明不一致"
+        )
     latency_parameters = (
         (identity.get("latency_model") or {}).get("parameters")
         if isinstance(identity.get("latency_model"), dict)
@@ -678,20 +681,19 @@ def _validate_performance_identity(
             "与 calibration.digest 不一致"
         )
 
-    if access_catalog:
-        if not manifest_id.endswith(f"-{digest[:16]}"):
-            raise ProfileContractError(
-                f"{source}: memory_profile_id 未绑定 performance_identity.digest"
-            )
-        if identity.get("identity_schema") != _RUNTIME_IDENTITY_SCHEMA:
-            raise ProfileContractError(
-                f"{field}.manifest.identity_schema 必须是 "
-                f"{_RUNTIME_IDENTITY_SCHEMA!r}"
-            )
-        if identity.get("access_catalog") != access_catalog:
-            raise ProfileContractError(
-                f"{field}.manifest.access_catalog 与顶层声明不一致"
-            )
+    if not manifest_id.endswith(f"-{digest[:16]}"):
+        raise ProfileContractError(
+            f"{source}: memory_profile_id 未绑定 performance_identity.digest"
+        )
+    if identity.get("identity_schema") != _RUNTIME_IDENTITY_SCHEMA:
+        raise ProfileContractError(
+            f"{field}.manifest.identity_schema 必须是 "
+            f"{_RUNTIME_IDENTITY_SCHEMA!r}"
+        )
+    if identity.get("access_catalog") != access_catalog:
+        raise ProfileContractError(
+            f"{field}.manifest.access_catalog 与顶层声明不一致"
+        )
     return value
 
 
