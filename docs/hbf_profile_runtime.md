@@ -265,8 +265,21 @@ request × layer 驻留分组，分别查询对应四维 Attention 性能，再�
 python -m serving \
   --cluster-config configs/cluster/hbf_profile_example.json \
   --dataset workloads/examples/<replace-with-workload>.jsonl \
+  --memory-tiering-stats-output results/{run_id}-hbf.json \
   --network-backend analytical
 ```
+
+`--memory-tiering-stats-output` 可选，支持 `{run_id}` 占位符。输出 JSON
+按 instance 记录：
+
+- HBM/HBF 驻留与容量高水位；
+- 显式迁移的方向、原因、对象类型和 transformer layer；
+- 策略动作计数与 batch 驻留命中；
+- Attention 查询中观察到的 HBM/HBF 驻留组。
+
+该统计只接收 Serving 完成的显式迁移和驻留事件，不含 Profile 已计入
+`time_us` 的 HBM/HBF demand 四向字节。需要审计算子 demand 流量时，应
+查看 Profile CSV 的四个 audit 列，不能把两类字节相加后称为迁移量。
 
 首次实验建议依次检查：
 
