@@ -1,4 +1,7 @@
 import csv
+import copy
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,7 +121,71 @@ def _v2_meta(
             if requirements is None
             else requirements
         )
+        _attach_runtime_metadata(meta)
     return meta
+
+
+def _attach_runtime_metadata(meta, access_catalog=None):
+    calibration_digest = "a" * 64
+    memory_integration = {"mode": "cli", "parameters": {}}
+    identity = {
+        "identity_schema": (
+            "llmcompass_profile_v2_performance_identity_v2"
+            if access_catalog
+            else "llmcompass_profile_v2_performance_identity_v1"
+        ),
+        "hardware": {"hardware_id": "test-gpu", "parameters": {}},
+        "memory_integration": memory_integration,
+        "traffic_resolver": {
+            "model_id": "test-resolver",
+            "parameters": {},
+        },
+        "latency_model": {
+            "model_id": "test-latency",
+            "parameters": {"calibration_digest": calibration_digest},
+        },
+        "scenario_catalog": meta["scenario_catalog"],
+    }
+    if access_catalog:
+        identity["access_catalog"] = access_catalog
+        meta["access_catalog"] = access_catalog
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    meta.update(
+        {
+            "calibration": {
+                "schema": "llmcompass_hbm_calibration_v1",
+                "digest": calibration_digest,
+                "acceptance_passed": True,
+            },
+            "performance_basis": {
+                "hbm": "measured_calibrated",
+                "hbf": "parameterized_projection",
+            },
+            "memory_integration": memory_integration,
+            "engine_effective": {
+                "max_num_batched_tokens": 128,
+                "max_num_seqs": 4,
+                "block_size": 16,
+            },
+            "attention_grid": {
+                "max_kv": 256,
+                "chunk_factor": 2.0,
+                "kv_factor": 2.0,
+            },
+            "performance_identity": {
+                "algorithm": "sha256",
+                "digest": digest,
+                "manifest": identity,
+            },
+        }
+    )
+    return digest
 
 
 def _base_row(filename, scenario="all_hbm"):
@@ -257,6 +324,71 @@ class ProfileV2ContractTest(unittest.TestCase):
                     validate_profile_meta(
                         meta,
                         requested_memory_profile_id="cli-a",
+                        source="meta.yaml",
+                    )
+
+    def test_runtime_ready_metadata_and_access_catalog_are_verified(self):
+        access_catalog = {
+            "op/input": {
+                "semantic": "activation",
+                "access_type": "read",
+                "lifetime": "iteration",
+            },
+            "op/output": {
+                "semantic": "output",
+                "access_type": "write",
+                "lifetime": "iteration",
+            },
+        }
+        meta = _v2_meta(readiness="runtime_ready")
+        digest = _attach_runtime_metadata(meta, access_catalog)
+        profile_id = f"test-gpu-cli-{digest[:16]}"
+        meta["memory_profile_id"] = profile_id
+
+        contract = validate_profile_meta(
+            meta,
+            requested_memory_profile_id=profile_id,
+            source="meta.yaml",
+        )
+        self.assertEqual(contract.access_catalog, access_catalog)
+        self.assertTrue(contract.calibration["acceptance_passed"])
+        self.assertEqual(contract.memory_integration["mode"], "cli")
+        self.assertEqual(contract.engine_effective["block_size"], 16)
+        self.assertEqual(contract.attention_grid["max_kv"], 256)
+
+        cases = {}
+        failed_calibration = copy.deepcopy(meta)
+        failed_calibration["calibration"]["acceptance_passed"] = False
+        cases["failed calibration"] = failed_calibration
+        wrong_basis = copy.deepcopy(meta)
+        wrong_basis["performance_basis"]["hbf"] = "measured"
+        cases["wrong performance basis"] = wrong_basis
+        wrong_integration = copy.deepcopy(meta)
+        wrong_integration["memory_integration"]["mode"] = "parallel"
+        cases["unknown integration"] = wrong_integration
+        wrong_block = copy.deepcopy(meta)
+        wrong_block["engine_effective"]["block_size"] = 0
+        cases["invalid block size"] = wrong_block
+        wrong_grid = copy.deepcopy(meta)
+        wrong_grid["attention_grid"]["max_kv"] = 0
+        cases["invalid attention range"] = wrong_grid
+        missing_access = copy.deepcopy(meta)
+        missing_access["scenario_catalog"]["all_hbm"]["accesses"].pop(
+            "op/output"
+        )
+        cases["incomplete scenario mapping"] = missing_access
+        forged_identity = copy.deepcopy(meta)
+        forged_identity["performance_identity"]["manifest"][
+            "access_catalog"
+        ]["op/input"]["semantic"] = "weight"
+        cases["forged identity"] = forged_identity
+
+        for name, invalid_meta in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ProfileContractError):
+                    validate_profile_meta(
+                        invalid_meta,
+                        requested_memory_profile_id=profile_id,
                         source="meta.yaml",
                     )
 
@@ -540,6 +672,20 @@ class ProfileV2ContractTest(unittest.TestCase):
                 )
 
         self.assertEqual(perf_db["bundle_readiness"], "runtime_ready")
+        self.assertTrue(perf_db["runtime_compatible"])
+        self.assertEqual(
+            perf_db["scenario_binding"],
+            "producer_verified_v1",
+        )
+        self.assertTrue(perf_db["calibration"]["acceptance_passed"])
+        self.assertEqual(
+            perf_db["performance_basis"],
+            {
+                "hbm": "measured_calibrated",
+                "hbf": "parameterized_projection",
+            },
+        )
+        self.assertEqual(perf_db["memory_integration"]["mode"], "cli")
         self.assertIn(
             ("gpu", "org/model", "bf16", "cli-a"),
             trace_generator._perf_db_cache,

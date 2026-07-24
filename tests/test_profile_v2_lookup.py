@@ -1,4 +1,6 @@
 import csv
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -99,6 +101,61 @@ def _meta(profile_id, *, skew_enabled=False, readiness="runtime_ready"):
             "attention_required": True,
             "moe_required": True,
         }
+        calibration_digest = "a" * 64
+        memory_integration = {"mode": "cli", "parameters": {}}
+        identity = {
+            "identity_schema": "llmcompass_profile_v2_performance_identity_v1",
+            "hardware": {"hardware_id": "test-gpu", "parameters": {}},
+            "memory_integration": memory_integration,
+            "traffic_resolver": {
+                "model_id": "test-resolver",
+                "parameters": {},
+            },
+            "latency_model": {
+                "model_id": "test-latency",
+                "parameters": {
+                    "calibration_digest": calibration_digest,
+                },
+            },
+            "scenario_catalog": meta["scenario_catalog"],
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        meta.update(
+            {
+                "calibration": {
+                    "schema": "llmcompass_hbm_calibration_v1",
+                    "digest": calibration_digest,
+                    "acceptance_passed": True,
+                },
+                "performance_basis": {
+                    "hbm": "measured_calibrated",
+                    "hbf": "parameterized_projection",
+                },
+                "memory_integration": memory_integration,
+                "engine_effective": {
+                    "max_num_batched_tokens": 128,
+                    "max_num_seqs": 4,
+                    "block_size": 16,
+                },
+                "attention_grid": {
+                    "max_kv": 256,
+                    "chunk_factor": 2.0,
+                    "kv_factor": 2.0,
+                },
+                "performance_identity": {
+                    "algorithm": "sha256",
+                    "digest": digest,
+                    "manifest": identity,
+                },
+            }
+        )
     if skew_enabled:
         meta["skew_fit"] = {"enabled": True}
     return meta

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 import os
 import re
@@ -61,6 +63,23 @@ _SCENARIO_MAPPING_KEYS = ("accesses", "access_tiers", "placements")
 PROFILE_V2_PARTIAL = "partial"
 PROFILE_V2_RUNTIME_READY = "runtime_ready"
 
+_ACCESS_CATALOG_FIELDS = {"semantic", "access_type", "lifetime"}
+_ACCESS_SEMANTICS = {
+    "weight",
+    "activation",
+    "kv_cache",
+    "output",
+    "temporary",
+}
+_ACCESS_TYPES = {"read", "write", "read_write"}
+_ACCESS_LIFETIMES = {"model", "request", "iteration", "operator"}
+_PERFORMANCE_BASIS = {
+    "hbm": "measured_calibrated",
+    "hbf": "parameterized_projection",
+}
+_MEMORY_INTEGRATION_MODES = {"cli", "csi"}
+_RUNTIME_IDENTITY_SCHEMA = "llmcompass_profile_v2_performance_identity_v2"
+
 _SCENARIO_BINDING_BY_READINESS = {
     PROFILE_V2_PARTIAL: "caller_asserted",
     PROFILE_V2_RUNTIME_READY: "producer_verified_v1",
@@ -98,6 +117,13 @@ class ProfileContract:
     scenario_binding: str | None
     tp_degrees: tuple[int, ...]
     architecture_requirements: Mapping[str, Any] | None
+    access_catalog: Mapping[str, Mapping[str, str]]
+    calibration: Mapping[str, Any] | None
+    performance_basis: Mapping[str, str] | None
+    memory_integration: Mapping[str, Any] | None
+    engine_effective: Mapping[str, int] | None
+    attention_grid: Mapping[str, Any] | None
+    performance_identity: Mapping[str, Any] | None
     meta: Mapping[str, Any]
 
     @property
@@ -362,6 +388,305 @@ def _validate_scenario_catalog(
     return catalog
 
 
+def _validate_access_catalog(
+    value: object,
+    *,
+    source: str,
+) -> Mapping[str, Mapping[str, str]]:
+    field = f"{source}: access_catalog"
+    if not isinstance(value, dict) or not value:
+        raise ProfileContractError(f"{field} 必须是非空 mapping")
+
+    catalog: dict[str, Mapping[str, str]] = {}
+    for key, declaration in value.items():
+        if (
+            not isinstance(key, str)
+            or key != key.strip()
+            or key.count("/") != 1
+        ):
+            raise ProfileContractError(
+                f"{field} 必须使用唯一的 operator_id/access_id 键"
+            )
+        operator_id, access_id = key.split("/")
+        if (
+            not _IDENTIFIER_RE.fullmatch(operator_id)
+            or not _IDENTIFIER_RE.fullmatch(access_id)
+            or ".." in operator_id
+            or ".." in access_id
+        ):
+            raise ProfileContractError(
+                f"{field}.{key} 不是合法 operator_id/access_id"
+            )
+        if not isinstance(declaration, dict):
+            raise ProfileContractError(f"{field}.{key} 必须是 mapping")
+        actual_fields = set(declaration)
+        if actual_fields != _ACCESS_CATALOG_FIELDS:
+            raise ProfileContractError(
+                f"{field}.{key} 必须且只能包含 "
+                "semantic、access_type、lifetime"
+            )
+        if declaration["semantic"] not in _ACCESS_SEMANTICS:
+            raise ProfileContractError(
+                f"{field}.{key}.semantic 不受支持："
+                f"{declaration['semantic']!r}"
+            )
+        if declaration["access_type"] not in _ACCESS_TYPES:
+            raise ProfileContractError(
+                f"{field}.{key}.access_type 不受支持："
+                f"{declaration['access_type']!r}"
+            )
+        if declaration["lifetime"] not in _ACCESS_LIFETIMES:
+            raise ProfileContractError(
+                f"{field}.{key}.lifetime 不受支持："
+                f"{declaration['lifetime']!r}"
+            )
+        catalog[key] = declaration
+    return catalog
+
+
+def _validate_runtime_ready_metadata(
+    meta: Mapping[str, Any],
+    *,
+    source: str,
+    manifest_id: str,
+    scenario_catalog: Mapping[str, Mapping[str, Any]],
+) -> tuple[
+    Mapping[str, Mapping[str, str]],
+    Mapping[str, Any],
+    Mapping[str, str],
+    Mapping[str, Any],
+    Mapping[str, int],
+    Mapping[str, Any],
+    Mapping[str, Any],
+]:
+    calibration = meta.get("calibration")
+    if not isinstance(calibration, dict):
+        raise ProfileContractError(f"{source}: calibration 必须是 mapping")
+    if calibration.get("acceptance_passed") is not True:
+        raise ProfileContractError(
+            f"{source}: calibration.acceptance_passed 必须显式为 true"
+        )
+    if calibration.get("schema") != "llmcompass_hbm_calibration_v1":
+        raise ProfileContractError(
+            f"{source}: calibration.schema 必须是 "
+            "'llmcompass_hbm_calibration_v1'"
+        )
+    calibration_digest = _sha256_digest(
+        calibration.get("digest"),
+        field=f"{source}: calibration.digest",
+    )
+
+    performance_basis = meta.get("performance_basis")
+    if performance_basis != _PERFORMANCE_BASIS:
+        raise ProfileContractError(
+            f"{source}: performance_basis 必须明确声明 "
+            "HBM 实测校准与 HBF 参数化预测"
+        )
+
+    memory_integration = meta.get("memory_integration")
+    if not isinstance(memory_integration, dict):
+        raise ProfileContractError(
+            f"{source}: memory_integration 必须是 mapping"
+        )
+    if memory_integration.get("mode") not in _MEMORY_INTEGRATION_MODES:
+        raise ProfileContractError(
+            f"{source}: memory_integration.mode 必须是 'cli' 或 'csi'"
+        )
+    if not isinstance(memory_integration.get("parameters"), dict):
+        raise ProfileContractError(
+            f"{source}: memory_integration.parameters 必须是 mapping"
+        )
+
+    engine_effective = _validate_engine_effective(
+        meta.get("engine_effective"),
+        source=source,
+    )
+    attention_grid = _validate_attention_grid(
+        meta.get("attention_grid"),
+        source=source,
+    )
+
+    access_catalog_value = meta.get("access_catalog")
+    access_catalog = (
+        {}
+        if access_catalog_value is None
+        else _validate_access_catalog(access_catalog_value, source=source)
+    )
+    if access_catalog:
+        access_keys = set(access_catalog)
+        for scenario_id, declaration in scenario_catalog.items():
+            mapping_key = next(
+                key for key in _SCENARIO_MAPPING_KEYS if key in declaration
+            )
+            if set(declaration[mapping_key]) != access_keys:
+                raise ProfileContractError(
+                    f"{source}: scenario_catalog.{scenario_id}.{mapping_key} "
+                    "必须完整覆盖 access_catalog"
+                )
+
+    performance_identity = _validate_performance_identity(
+        meta.get("performance_identity"),
+        source=source,
+        manifest_id=manifest_id,
+        memory_integration=memory_integration,
+        access_catalog=access_catalog,
+        calibration_digest=calibration_digest,
+    )
+    return (
+        access_catalog,
+        calibration,
+        performance_basis,
+        memory_integration,
+        engine_effective,
+        attention_grid,
+        performance_identity,
+    )
+
+
+def _sha256_digest(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ProfileContractError(
+            f"{field} 必须是小写 SHA-256 十六进制字符串"
+        )
+    return value
+
+
+def _validate_engine_effective(
+    value: object,
+    *,
+    source: str,
+) -> Mapping[str, int]:
+    field = f"{source}: engine_effective"
+    expected = {
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "block_size",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ProfileContractError(
+            f"{field} 必须且只能包含 max_num_batched_tokens、"
+            "max_num_seqs、block_size"
+        )
+    return {
+        key: _parse_nonnegative_integer(
+            item,
+            field=f"{field}.{key}",
+            positive=True,
+        )
+        for key, item in value.items()
+    }
+
+
+def _validate_attention_grid(
+    value: object,
+    *,
+    source: str,
+) -> Mapping[str, Any]:
+    field = f"{source}: attention_grid"
+    expected = {"max_kv", "chunk_factor", "kv_factor"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ProfileContractError(
+            f"{field} 必须且只能包含 max_kv、chunk_factor、kv_factor"
+        )
+    max_kv = _parse_nonnegative_integer(
+        value["max_kv"],
+        field=f"{field}.max_kv",
+        positive=True,
+    )
+    factors = {}
+    for name in ("chunk_factor", "kv_factor"):
+        try:
+            factor = float(value[name])
+        except (TypeError, ValueError):
+            raise ProfileContractError(
+                f"{field}.{name} 必须是大于 1 的有限数"
+            ) from None
+        if not math.isfinite(factor) or factor <= 1:
+            raise ProfileContractError(
+                f"{field}.{name} 必须是大于 1 的有限数"
+            )
+        factors[name] = factor
+    return {"max_kv": max_kv, **factors}
+
+
+def _validate_performance_identity(
+    value: object,
+    *,
+    source: str,
+    manifest_id: str,
+    memory_integration: Mapping[str, Any],
+    access_catalog: Mapping[str, Mapping[str, str]],
+    calibration_digest: str,
+) -> Mapping[str, Any]:
+    field = f"{source}: performance_identity"
+    if not isinstance(value, dict):
+        raise ProfileContractError(f"{field} 必须是 mapping")
+    if value.get("algorithm") != "sha256":
+        raise ProfileContractError(f"{field}.algorithm 必须是 'sha256'")
+    digest = _sha256_digest(
+        value.get("digest"),
+        field=f"{field}.digest",
+    )
+    identity = value.get("manifest")
+    if not isinstance(identity, dict):
+        raise ProfileContractError(f"{field}.manifest 必须是 mapping")
+
+    try:
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ProfileContractError(
+            f"{field}.manifest 不是可规范化的 JSON：{exc}"
+        ) from exc
+    actual_digest = hashlib.sha256(encoded).hexdigest()
+    if actual_digest != digest:
+        raise ProfileContractError(
+            f"{field}.digest 与 manifest 内容不一致"
+        )
+    if identity.get("memory_integration") != memory_integration:
+        raise ProfileContractError(
+            f"{field}.manifest.memory_integration 与顶层声明不一致"
+        )
+    latency_parameters = (
+        (identity.get("latency_model") or {}).get("parameters")
+        if isinstance(identity.get("latency_model"), dict)
+        else None
+    )
+    if (
+        not isinstance(latency_parameters, dict)
+        or latency_parameters.get("calibration_digest") != calibration_digest
+    ):
+        raise ProfileContractError(
+            f"{field}.manifest.latency_model.parameters.calibration_digest "
+            "与 calibration.digest 不一致"
+        )
+
+    if access_catalog:
+        if not manifest_id.endswith(f"-{digest[:16]}"):
+            raise ProfileContractError(
+                f"{source}: memory_profile_id 未绑定 performance_identity.digest"
+            )
+        if identity.get("identity_schema") != _RUNTIME_IDENTITY_SCHEMA:
+            raise ProfileContractError(
+                f"{field}.manifest.identity_schema 必须是 "
+                f"{_RUNTIME_IDENTITY_SCHEMA!r}"
+            )
+        if identity.get("access_catalog") != access_catalog:
+            raise ProfileContractError(
+                f"{field}.manifest.access_catalog 与顶层声明不一致"
+            )
+    return value
+
+
 def validate_profile_meta(
     meta: Mapping[str, Any],
     *,
@@ -395,6 +720,11 @@ def validate_profile_meta(
                 "runtime_compatible",
                 "scenario_binding",
                 "architecture_requirements",
+                "access_catalog",
+                "calibration",
+                "performance_basis",
+                "memory_integration",
+                "performance_identity",
             )
             if key in meta
         )
@@ -412,6 +742,13 @@ def validate_profile_meta(
             scenario_binding=None,
             tp_degrees=(),
             architecture_requirements=None,
+            access_catalog={},
+            calibration=None,
+            performance_basis=None,
+            memory_integration=None,
+            engine_effective=None,
+            attention_grid=None,
+            performance_identity=None,
             meta=meta,
         )
 
@@ -478,12 +815,33 @@ def validate_profile_meta(
                 f"{source}: partial bundle 不得声明 architecture_requirements"
             )
         architecture_requirements = None
+        access_catalog = {}
+        calibration = None
+        performance_basis = None
+        memory_integration = meta.get("memory_integration")
+        engine_effective = None
+        attention_grid = None
+        performance_identity = meta.get("performance_identity")
     else:
         architecture_requirements = _validate_architecture_requirements(
             requirements_value,
             source=source,
             tp_degrees=tp_degrees,
             scenario_ids=set(catalog),
+        )
+        (
+            access_catalog,
+            calibration,
+            performance_basis,
+            memory_integration,
+            engine_effective,
+            attention_grid,
+            performance_identity,
+        ) = _validate_runtime_ready_metadata(
+            meta,
+            source=source,
+            manifest_id=manifest_id,
+            scenario_catalog=catalog,
         )
 
     return ProfileContract(
@@ -496,6 +854,13 @@ def validate_profile_meta(
         scenario_binding=scenario_binding,
         tp_degrees=tp_degrees,
         architecture_requirements=architecture_requirements,
+        access_catalog=access_catalog,
+        calibration=calibration,
+        performance_basis=performance_basis,
+        memory_integration=memory_integration,
+        engine_effective=engine_effective,
+        attention_grid=attention_grid,
+        performance_identity=performance_identity,
         meta=meta,
     )
 
