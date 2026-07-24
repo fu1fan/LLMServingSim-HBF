@@ -31,6 +31,10 @@ from serving.core.memory_scenario import (
     parse_instance_performance_profile,
     validate_memory_scenario_compatibility,
 )
+from serving.core.memory_tiering_config import (
+    parse_instance_memory_tiering,
+    validate_homogeneous_hbf_instances,
+)
 import sys as flush
 
 from pyinstrument import Profiler
@@ -161,6 +165,7 @@ def _build_instance_runtime_configs(
     dtype_to_bits,
     placements=None,
 ):
+    validate_homogeneous_hbf_instances(instances)
     if placements is not None and len(placements) != len(instances):
         raise RuntimeError(
             "instances 与 normalized placements 数量不一致："
@@ -190,6 +195,10 @@ def _build_instance_runtime_configs(
                 f"Instance {instance_id} 的模型配置缺少 num_hidden_layers"
             )
         memory_scenario_policy = parse_instance_performance_profile(
+            instance,
+            model_config["num_hidden_layers"],
+        )
+        memory_tiering = parse_instance_memory_tiering(
             instance,
             model_config["num_hidden_layers"],
         )
@@ -224,6 +233,7 @@ def _build_instance_runtime_configs(
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
             "memory_scenario_policy": memory_scenario_policy,
+            "memory_tiering": memory_tiering,
         })
     return runtime_configs
 
@@ -701,6 +711,7 @@ def main():
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        memory_scenario_policy=inst_cfg["memory_scenario_policy"],
+                                       runtime_block_size=inst_cfg["block_size"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -769,6 +780,7 @@ def main():
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            memory_scenario_policy=inst_cfg["memory_scenario_policy"],
+                                           runtime_block_size=inst_cfg["block_size"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -806,6 +818,7 @@ def main():
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    memory_scenario_policy=inst_cfg["memory_scenario_policy"],
+                                   runtime_block_size=inst_cfg["block_size"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

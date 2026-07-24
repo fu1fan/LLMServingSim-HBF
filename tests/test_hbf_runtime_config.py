@@ -1,0 +1,104 @@
+import unittest
+import sys
+import types
+from types import SimpleNamespace
+from unittest.mock import patch
+
+pyinstrument = types.ModuleType("pyinstrument")
+pyinstrument.Profiler = object
+sys.modules.setdefault("pyinstrument", pyinstrument)
+
+import serving.__main__ as serving_main
+
+
+def _args():
+    return SimpleNamespace(
+        dtype=None,
+        kv_cache_dtype="auto",
+        enable_attn_offloading=False,
+        enable_sub_batch_interleaving=False,
+        enable_local_offloading=False,
+        max_num_seqs=128,
+        max_num_batched_tokens=2048,
+        long_prefill_token_threshold=0,
+        block_size=16,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        prioritize_prefill=False,
+        enable_block_copy=True,
+    )
+
+
+def _placement():
+    return {
+        "default": {"weights": "LOCAL", "kv_loc": "LOCAL"},
+        "block": [],
+        "layer": {},
+    }
+
+
+def _instance(*, hbf=False):
+    value = {"model_name": "test-model", "block_size": 32}
+    if hbf:
+        value.update(
+            {
+                "hbf_mem": {"mem_size": 64},
+                "performance_profile": {
+                    "mode": "memory_scenario_v2",
+                    "memory_profile_id": "hbf-four-way",
+                    "scenario_selection": "residency_derived",
+                },
+                "memory_tiering": {
+                    "weights": {
+                        "policy": "static_map",
+                        "default_tier": "hbf",
+                    }
+                },
+            }
+        )
+    return value
+
+
+class HbfRuntimeConfigTest(unittest.TestCase):
+    @patch.object(
+        serving_main,
+        "get_config",
+        return_value={
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 32,
+        },
+    )
+    def test_runtime_config_carries_verified_tiering_contract(self, _):
+        configs = serving_main._build_instance_runtime_configs(
+            [_instance(hbf=True)],
+            _args(),
+            {"bfloat16": 16},
+            placements=[_placement()],
+        )
+
+        self.assertEqual(configs[0]["block_size"], 32)
+        self.assertTrue(configs[0]["memory_tiering"].enabled)
+        self.assertTrue(
+            configs[0]["memory_scenario_policy"].is_residency_derived
+        )
+
+    @patch.object(
+        serving_main,
+        "get_config",
+        return_value={
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 32,
+        },
+    )
+    def test_runtime_rejects_mixed_gpu_families_before_scheduling(self, _):
+        with self.assertRaisesRegex(ValueError, "不能混用"):
+            serving_main._build_instance_runtime_configs(
+                [_instance(hbf=True), _instance(hbf=False)],
+                _args(),
+                {"bfloat16": 16},
+                placements=[_placement(), _placement()],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
