@@ -67,6 +67,12 @@ HBF 实例要求 manifest 至少满足：
 - 完整的 `architecture_requirements`、`engine_effective`、
   `attention_grid` 和目标 `tp<N>`；
 - `memory_integration.mode` 为 `cli` 或 `csi`；
+- `memory_integration.parameters` 使用 `schema_version: 1`、
+  `timing_model: directional_v1`、
+  `bandwidth_scope: pure_direction_effective`；
+- HBM/HBF 均使用 `read_write_service: time_shared`，四个方向均使用
+  `latency_scope: per_stream`；
+- `fabric_model: none` 且独立 fabric 带宽为 `null`；
 - 顶层 `access_catalog` 与 performance identity 中的副本完全一致；
 - 每个 `scenario_catalog.<id>.accesses` 精确覆盖全部
   `access_catalog` 键。
@@ -181,7 +187,12 @@ LLMServingSim 从 Profile 读取 HBM/HBF 的 read/write
 `bandwidth_byte_per_second` 和 `fixed_latency_second`，转换为 ASTRA
 使用的 GB/s 与 ns。集群 JSON 只提供容量，不重复声明这些性能参数。
 Profile 内的 `memory_integration.parameters.integration_mode` 还必须与
-顶层 `memory_integration.mode` 一致。
+顶层 `memory_integration.mode` 一致。ASTRA 当前使用整数 GB/s 和 ns，
+适配器采用最近整数进行量化；零固定延迟保持为零。
+
+运行就绪导出器和 Serving 加载器都会拒绝 `per_request_batch`、
+`distinct_shared_resource`、`embedded_in_joint_calibration` 等尚不能
+等价执行的参数，而不是静默套用近似公式。
 
 ### CLI
 
@@ -198,9 +209,9 @@ read/write 参数约束。
 ### CSI
 
 `memory_integration.mode: csi` 把两者放入同一个
-`gpu-memory-data` 服务域。若 Profile 提供
-`gpu_memory_fabric_bandwidth_byte_per_second`，该值还会成为共享服务域
-上限。这样 HBM 与 HBF 的显式传输竞争同一 GPU 侧数据通路。
+`gpu-memory-data` 服务域，使 HBM 与 HBF 的显式传输竞争同一 GPU 侧
+数据通路。独立 fabric 流水级尚未进入 ASTRA 主链，因此不能在运行就绪
+Profile 中配置 fabric 带宽上限。
 
 同一次仿真中的所有 HBF instance 必须使用相同 performance identity
 和内存集成参数。当前也禁止普通 GPU instance 与 HBF GPU instance
@@ -216,18 +227,18 @@ CLI 即可进入当前 Scheduler/Trace/ASTRA 路径。
 | 权重 | `hbm_only` | 主链路可用，全部静态驻留 HBM |
 | 权重 | `hbf_only` | 主链路可用，全部静态驻留 HBF |
 | 权重 | `static_map` | 主链路可用；优先级为 layer > block > default |
-| 权重 | `hbf_backed_hbm_cache` | 策略引擎已有提升/LRU 接口，CLI 主循环尚未驱动；不要用于正式实验 |
+| 权重 | `hbf_backed_hbm_cache` | 策略引擎已有提升/LRU 接口；启动门禁拒绝，避免被误当成静态 HBF |
 | KV | `hbm_only` | 主链路可用 |
 | KV | `hbf_only` | 主链路可用 |
 | KV | `length_threshold` | 主链路可用；以 request × transformer layer 为最小驻留单位，跨阈值时生成整层显式迁移 |
-| KV | `watermark_lru` | 需要外部注入 `select_kv_tier()` 引擎；当前集群 JSON 不会创建该引擎 |
+| KV | `watermark_lru` | 策略接口已有；CLI 主循环启动门禁拒绝 |
 | Prefix | `hbm_only` | 与当前 RadixCache 主链路兼容 |
-| Prefix | `hbf_only`、`hbf_backed_hbm_hot`、`instance_affinity` | 配置与策略接口已定义，但尚未接入 RadixCache |
+| Prefix | `hbf_only`、`hbf_backed_hbm_hot`、`instance_affinity` | 配置与策略接口已定义；启动门禁拒绝，尚未接入 RadixCache |
 | Transfer | `prefetch: none` | 当前安全默认值 |
-| Transfer | `next_layer`、`next_batch` | 已有配置契约，主循环尚未发起对应预取 |
-| Transfer | `capacity_fallback` | 已有配置契约，当前 KV 主调度未消费 |
+| Transfer | `next_layer`、`next_batch` | 已有配置契约；启动门禁拒绝，主循环尚未发起对应预取 |
+| Transfer | `capacity_fallback` | 当前只允许 `reject`；CPU/CXL/HBF fallback 尚无完整四向迁移链 |
 | 通信缓冲 | `tier: hbm` | 当前安全默认值，原有 collective 链路不变 |
-| 通信缓冲 | `tier: hbf` | 需要显式 `allow_hbf_staging: true`，但主循环尚未生成 staging 节点 |
+| 通信缓冲 | `tier: hbf` | 配置接口已有；启动门禁拒绝，主循环尚未生成 staging 节点 |
 
 若配置 `hbf_mem` 但省略 `memory_tiering`，所有持久对象仍默认在 HBM，
 可用于验证普通 HBM 基线和 HBF Profile 加载契约。
@@ -241,7 +252,7 @@ CLI 即可进入当前 Scheduler/Trace/ASTRA 路径。
 | TP | 保持原行为 | 支持 Profile 已覆盖的 TP；ALLREDUCE 仍由 ASTRA 计费 |
 | PP | 保持原行为 | 原链路保留；权重容量按 PP stage 和 block 分账 |
 | DP 同步 | 保持原行为 | 原同步链路保留；全部 HBF instance 必须使用同一性能身份 |
-| P/D 分离 | 保持原行为 | 路由与原通信链路保留；Decode 侧按自身策略重新准入 KV，尚无独立的 tier-aware 跨实例 KV 交接策略 |
+| P/D 分离 | 保持原行为 | 路由与原通信链路保留；当前强制 KV 为 `hbm_only`，HBF 权重仍可使用；tier-aware 跨实例 KV 交接尚未实现 |
 | Dense Llama 3.x / Qwen3 | 保持原行为 | 当前 LLMCompass `runtime_ready` 导出与跨仓验收的主要运行范围 |
 | MoE / EP / DP+EP | 保持原行为 | 只有完整 HBF MoE Profile 才可运行；必须声明 `moe_required` 并为全部场景提供 `moe.csv`。当前 Dense 导出不能替代它 |
 | Prefix Caching / 多轮会话 | 保持原行为 | 会话依赖和路由保留；启用 RadixCache 时 KV 与 Prefix 策略必须均为 `hbm_only` |
@@ -249,6 +260,7 @@ CLI 即可进入当前 Scheduler/Trace/ASTRA 路径。
 | local weight offload | 保持原行为 | Profile v2 启动门禁禁用 |
 | PIM Attention offload | 保持原行为 | Profile v2 启动门禁禁用 |
 | sub-batch interleaving | 保持原行为 | Profile v2 启动门禁禁用 |
+| active-KV CPU/CXL 抢占 | 保持原行为 | 容量压力触发时 fail closed；旧 aggregate 行不能代替 HBM/HBF 四向显式迁移 |
 
 Attention 遇到同一 batch 内 HBM/HBF 混合 KV 时，会按实际
 request × layer 驻留分组，分别查询对应四维 Attention 性能，再合成为
@@ -257,6 +269,10 @@ request × layer 驻留分组，分别查询对应四维 Attention 性能，再�
 普通 GPU 配置不含 `hbf_mem` 时，分层功能关闭，权重和 KV 继续使用
 原有 NPU/HBM 分账，Profile v1、调度、Prefix、offload 和并行框架不会
 被 HBF 默认值改变。
+
+HBF 模式启用 Prefix Caching 时，KV 与 Prefix 必须为 `hbm_only`；若
+transformer 层数不能整除 PP，当前 RadixCache 的标量容量接口无法表达
+非均匀 stage，启动门禁也会拒绝该组合。
 
 ## 7. 运行与检查
 
