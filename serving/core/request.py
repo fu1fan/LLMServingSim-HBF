@@ -41,6 +41,9 @@ class Request:
         self.session_id = None
         self.sub_request_index = None
 
+        # 分层 KV 的权威账本保存在 MemoryModel；请求只保留调度状态。
+        self.kv_was_tiered_evicted = False
+
     # to print the request information
     def __str__(self):
         return str(self.__dict__) 
@@ -53,7 +56,7 @@ class Request:
             self.tpot = 0
         else:
             self.tpot = (self.latency - self.ttft) // (self.output - self.input - 1)
-    
+
     def add_itl(self, current): # 
         self.itl.append(current - self.recent_end)
         self.recent_end = current
@@ -98,6 +101,9 @@ class Batch:
 
         # for debugging
         self.scheduled_tokens = None
+        # Profile 场景和显式迁移节点共同消费这两个不可变快照。
+        self.memory_view = None
+        self.memory_transfers = ()
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():
@@ -107,4 +113,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

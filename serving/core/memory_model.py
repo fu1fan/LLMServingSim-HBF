@@ -395,13 +395,9 @@ class MemoryModel():
         if policy.policy == "hbf_only":
             return MemoryTier.HBF
         if policy.policy == "length_threshold":
-            if projected_tokens <= policy.threshold_tokens:
+            if projected_tokens < policy.threshold_tokens:
                 return policy.admission_tier
-            return (
-                MemoryTier.HBF
-                if policy.admission_tier is MemoryTier.HBM
-                else MemoryTier.HBM
-            )
+            return MemoryTier.HBF
         if policy.policy == "watermark_lru":
             selector = getattr(self.kv_policy_engine, "select_kv_tier", None)
             if not callable(selector):

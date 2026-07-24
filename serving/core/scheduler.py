@@ -20,7 +20,8 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
+                 memory_tiering=None, kv_policy_engine=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -46,7 +47,27 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
+        self.memory = MemoryModel(
+            model,
+            instance_id,
+            node_id,
+            num_npus,
+            tp_size,
+            npu_mem,
+            cpu_mem,
+            block_size,
+            fp,
+            enable_prefix_caching,
+            enable_prefix_sharing,
+            prefix_pool,
+            prefix_storage,
+            cxl_mem,
+            ep_size=ep_size,
+            pp_size=pp_size,
+            kv_cache_dtype=kv_cache_dtype,
+            memory_tiering=memory_tiering,
+            kv_policy_engine=kv_policy_engine,
+        )
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
@@ -64,6 +85,35 @@ class Scheduler:
             if req.evict:
                 load_size += self.memory.get_evict_kv(req)
         return load_size
+
+    def _plan_tiered_kv(self, batch_req, batch_len, scheduled_tokens):
+        if not self.memory.tiering_enabled:
+            return None
+        return self.memory.plan_kv_allocation(
+            batch_req,
+            batch_len,
+            scheduled_tokens,
+        )
+
+    def _tiered_candidate_fits(
+        self,
+        batch_req,
+        batch_len,
+        scheduled_tokens,
+    ):
+        plan = self._plan_tiered_kv(
+            batch_req,
+            batch_len,
+            scheduled_tokens,
+        )
+        return plan, self.memory.is_kv_plan_avail(plan)
+
+    def _release_request_kv(self, req):
+        if self.memory.tiering_enabled:
+            self.memory.release_request_kv(req)
+        else:
+            kv_size = self.memory.get_evict_kv(req)
+            self.memory.free(kv_size, Device.NPU)
 
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
@@ -182,9 +232,24 @@ class Scheduler:
             # ============ STEP 2: KV size calculation (with scheduled_tokens) ============
             temp_len = batch_len
             for i in range(batch_len, -1, -1):
-                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
                 load_size = self._get_reload_size(batch_req, i)
-                if self.memory.is_avail(kv_size + load_size, Device.NPU):
+                if self.memory.tiering_enabled:
+                    kv_plan, fits = self._tiered_candidate_fits(
+                        batch_req,
+                        i,
+                        scheduled_tokens,
+                    )
+                else:
+                    kv_size = self.memory.get_block_kv(
+                        batch_req,
+                        i,
+                        scheduled_tokens,
+                    )
+                    fits = self.memory.is_avail(
+                        kv_size + load_size,
+                        Device.NPU,
+                    )
+                if fits:
                     temp_len = i
                     break
             
@@ -211,7 +276,11 @@ class Scheduler:
                 # bytes; cpu_used is tracked in full-cluster bytes (matches
                 # MemoryModel.apply_kv_cache_events convention), so scale by
                 # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evicted_kv_size, Device.NPU)
+                if self.memory.tiering_enabled:
+                    self.memory.release_request_kv(req_to_evict)
+                    req_to_evict.kv_was_tiered_evicted = True
+                else:
+                    self.memory.free(evicted_kv_size, Device.NPU)
                 self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
 
                 if len(gen_req) < batch_len:
@@ -219,9 +288,24 @@ class Scheduler:
 
                 # check if can batch
                 for i in range(batch_len, -1, -1):
-                    kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
                     load_size = self._get_reload_size(batch_req, i)
-                    if self.memory.is_avail(kv_size + load_size, Device.NPU):
+                    if self.memory.tiering_enabled:
+                        kv_plan, fits = self._tiered_candidate_fits(
+                            batch_req,
+                            i,
+                            scheduled_tokens,
+                        )
+                    else:
+                        kv_size = self.memory.get_block_kv(
+                            batch_req,
+                            i,
+                            scheduled_tokens,
+                        )
+                        fits = self.memory.is_avail(
+                            kv_size + load_size,
+                            Device.NPU,
+                        )
+                    if fits:
                         temp_len = i
                         break
 
@@ -229,8 +313,23 @@ class Scheduler:
             batch_req = batch_req[:batch_len]
 
             # Recompute kv_size for final batch
-            kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
             load_size = self._get_reload_size(batch_req, batch_len)
+            kv_plan = None
+            if self.memory.tiering_enabled:
+                kv_plan = self.memory.plan_kv_allocation(
+                    batch_req,
+                    batch_len,
+                    scheduled_tokens,
+                )
+                if not self.memory.is_kv_plan_avail(kv_plan):
+                    raise RuntimeError("最终 batch 的 KV 分层容量事务失效")
+                kv_size = kv_plan.growth_bytes_per_rank
+            else:
+                kv_size = self.memory.get_block_kv(
+                    batch_req,
+                    batch_len,
+                    scheduled_tokens,
+                )
 
             # delete from request queue
             for req in batch_req:
@@ -244,14 +343,20 @@ class Scheduler:
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 4: Allocate memory ============
-            if kv_size > 0:
+            if kv_plan is not None:
+                self.memory.apply_kv_plan(kv_plan)
+            elif kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
 
             # Reload evicted KV to NPU and remove the spilled copy from CPU.
             # load_size is per-rank, cpu_used is full-cluster.
             if load_size > 0:
-                self.memory.allocate(load_size, Device.NPU)
+                if not self.memory.tiering_enabled:
+                    self.memory.allocate(load_size, Device.NPU)
                 self.memory.free(load_size * self.num_npus, Device.CPU)
+                for req in batch_req:
+                    if req.kv_was_tiered_evicted:
+                        req.kv_was_tiered_evicted = False
             
             # ============ STEP 5: Build batch with lists ============
             total_len = 0
@@ -304,6 +409,9 @@ class Scheduler:
             # batch.log()
             # add scheduled_tokens to batch for debugging
             batch.scheduled_tokens = scheduled_tokens
+            if self.memory.tiering_enabled:
+                batch.memory_view = self.memory.batch_memory_view(batch_req)
+                batch.memory_transfers = self.memory.take_kv_transfer_events()
             return batch
         
         # Schedule already batched request
@@ -634,6 +742,9 @@ class Scheduler:
             )
             # print(f"[BATCH DEBUG] Batch: {len(new_batch_req)} reqs, scheduled_tokens: {scheduled_tokens}")
             batch.scheduled_tokens = scheduled_tokens
+            if self.memory.tiering_enabled:
+                batch.memory_view = self.memory.batch_memory_view(batch_req)
+                batch.memory_transfers = self.memory.take_kv_transfer_events()
             # batch.log()
             return batch
         # Schedule already batched request
@@ -732,8 +843,7 @@ class Scheduler:
                         if self.enable_prefix_caching:
                             self.memory.unlock_prefix(req, Device.NPU)
                         else:
-                            kv_size = self.memory.get_evict_kv(req)
-                            self.memory.free(kv_size, Device.NPU)
+                            self._release_request_kv(req)
 
                         end_reqs.append(req)
                         continue
@@ -786,8 +896,7 @@ class Scheduler:
                     if self.prefix_storage is not None:
                         self.memory.cache_finished_req(req, Device.CPU)
                 else:
-                    kv_size = self.memory.get_evict_kv(req)
-                    self.memory.free(kv_size, Device.NPU)
+                    self._release_request_kv(req)
                 req.add_latency(finish)
                 self.done.append(req)
                 end_reqs.append(req)
@@ -837,8 +946,16 @@ class Scheduler:
                 self.memory.evict_prefix_cache(evict_size, Device.NPU)
             self.memory.cache_unfinished_req(req, Device.NPU)
         else:
-            kv_size = self.memory.get_total_kv(req)
-            self.memory.allocate(kv_size, Device.NPU)
+            if self.memory.tiering_enabled:
+                plan = self.memory.plan_kv_allocation([req])
+                if not self.memory.is_kv_plan_avail(plan):
+                    raise RuntimeError(
+                        f"Decode instance 无法容纳 request #{req.id} 的 KV"
+                    )
+                self.memory.apply_kv_plan(plan)
+            else:
+                kv_size = self.memory.get_total_kv(req)
+                self.memory.allocate(kv_size, Device.NPU)
     
     # get first request's arrival time
     def get_first_arrival_time(self):
