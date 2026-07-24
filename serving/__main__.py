@@ -35,6 +35,7 @@ from serving.core.memory_tiering_config import (
     parse_instance_memory_tiering,
     validate_homogeneous_hbf_instances,
 )
+from serving.core.hbf_memory_config import install_hbf_memory_resources
 import sys as flush
 
 from pyinstrument import Profiler
@@ -398,6 +399,21 @@ def main():
         _dtype_to_bits,
         placements=placement,
     )
+    hbf_memory_spec = install_hbf_memory_resources(
+        cluster["memory_config_path"],
+        instances,
+        instance_runtime_configs,
+        profiler_root=os.path.abspath(
+            os.path.join(astra_sim, "..", "profiler", "perf")
+        ),
+        variant_resolver=resolve_variant,
+    )
+    if hbf_memory_spec is not None:
+        _validate_memory_config(
+            cluster["memory_config_path"],
+            placement,
+            enable_local_offloading=True,
+        )
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration

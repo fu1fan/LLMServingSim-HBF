@@ -820,5 +820,7 @@ def _mem_str(loc, node_id):
         return f"REMOTE:{node_id}"
     elif loc.upper().startswith("CXL"):
         return loc.upper()
+    elif loc.upper().startswith("HBF"):
+        return loc.upper()
     else:
         raise ValueError(f"Unknown memory placement name '{loc}'")
