@@ -530,6 +530,7 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            memory_tiering=inst_cfg["memory_tiering"],
         ))
 
     # Controller for astra-sim process communication
@@ -684,6 +685,10 @@ def main():
                 dummy = Batch(schedulers[instance_id].get_batch_id(), instances[instance_id]["model_name"],
                               1, 1, [1], [], 0, 1, [], [], [1], current, 0)
                 dummy.fired.append(sys)
+                if schedulers[instance_id].memory.tiering_enabled:
+                    dummy.memory_view = schedulers[
+                        instance_id
+                    ].memory.batch_memory_view(())
                 dp_pending[dg][instance_id] = (dummy, inst2node_mapping[instance_id])
 
                 if len(dp_pending[dg]) == len(dp_groups[dg]):
