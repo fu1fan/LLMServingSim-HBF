@@ -63,6 +63,7 @@ HBF 实例要求 manifest 至少满足：
   `calibration.acceptance_passed: true`；
 - `performance_basis.hbm: measured_calibrated`；
 - `performance_basis.hbf: parameterized_projection`；
+- `latency_accounting.demand_access_included: true`；
 - 完整的 `architecture_requirements`、`engine_effective`、
   `attention_grid` 和目标 `tp<N>`；
 - `memory_integration.mode` 为 `cli` 或 `csi`；
@@ -264,13 +265,14 @@ request × layer 驻留分组，分别查询对应四维 Attention 性能，再�
 ```bash
 python -m serving \
   --cluster-config configs/cluster/hbf_profile_example.json \
-  --dataset workloads/examples/<replace-with-workload>.jsonl \
+  --dataset workloads/examples/replace-with-workload.jsonl \
   --memory-tiering-stats-output results/{run_id}-hbf.json \
   --network-backend analytical
 ```
 
 `--memory-tiering-stats-output` 可选，支持 `{run_id}` 占位符。输出 JSON
-按 instance 记录：
+按 instance 记录。相对路径以运行时的 `astra-sim` 工作目录为基准；
+若需要固定输出位置，建议传入绝对路径。
 
 - HBM/HBF 驻留与容量高水位；
 - 显式迁移的方向、原因、对象类型和 transformer layer；
