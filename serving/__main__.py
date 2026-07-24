@@ -27,6 +27,10 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.memory_scenario import (
+    parse_instance_performance_profile,
+    validate_memory_scenario_compatibility,
+)
 import sys as flush
 
 from pyinstrument import Profiler
@@ -151,7 +155,17 @@ def _resolve_instance_dtype(instance, cli_dtype, dtype_to_bits):
     return dtype
 
 
-def _build_instance_runtime_configs(instances, args, dtype_to_bits):
+def _build_instance_runtime_configs(
+    instances,
+    args,
+    dtype_to_bits,
+    placements=None,
+):
+    if placements is not None and len(placements) != len(instances):
+        raise RuntimeError(
+            "instances 与 normalized placements 数量不一致："
+            f"{len(instances)} != {len(placements)}"
+        )
     runtime_configs = []
     for instance_id, instance in enumerate(instances):
         dtype = _resolve_instance_dtype(instance, args.dtype, dtype_to_bits)
@@ -165,6 +179,30 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
         if enable_sub_batch_interleaving and not enable_attn_offloading:
             raise RuntimeError(
                 f"Instance {instance_id} enables sub-batch interleaving without attention offloading")
+
+        enable_local_offloading = instance.get(
+            "enable_local_offloading",
+            args.enable_local_offloading,
+        )
+        model_config = get_config(instance["model_name"])
+        if "num_hidden_layers" not in model_config:
+            raise KeyError(
+                f"Instance {instance_id} 的模型配置缺少 num_hidden_layers"
+            )
+        memory_scenario_policy = parse_instance_performance_profile(
+            instance,
+            model_config["num_hidden_layers"],
+        )
+        normalized_placement = None
+        if placements is not None:
+            normalized_placement = placements[instance_id]
+        validate_memory_scenario_compatibility(
+            memory_scenario_policy,
+            enable_local_offloading=enable_local_offloading,
+            enable_attn_offloading=enable_attn_offloading,
+            enable_sub_batch_interleaving=enable_sub_batch_interleaving,
+            placement=normalized_placement,
+        )
 
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
@@ -181,11 +219,11 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_prefix_caching": instance.get(
                 "enable_prefix_caching", args.enable_prefix_caching),
             "prioritize_prefill": instance.get("prioritize_prefill", args.prioritize_prefill),
-            "enable_local_offloading": instance.get(
-                "enable_local_offloading", args.enable_local_offloading),
+            "enable_local_offloading": enable_local_offloading,
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
+            "memory_scenario_policy": memory_scenario_policy,
         })
     return runtime_configs
 
@@ -344,7 +382,12 @@ def main():
     power_modeling = cluster["power_modeling"]
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
-    instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
+    instance_runtime_configs = _build_instance_runtime_configs(
+        instances,
+        args,
+        _dtype_to_bits,
+        placements=placement,
+    )
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration
@@ -657,6 +700,7 @@ def main():
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
+                                       memory_scenario_policy=inst_cfg["memory_scenario_policy"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -724,6 +768,7 @@ def main():
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
+                                           memory_scenario_policy=inst_cfg["memory_scenario_policy"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -760,6 +805,7 @@ def main():
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
+                                   memory_scenario_policy=inst_cfg["memory_scenario_policy"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

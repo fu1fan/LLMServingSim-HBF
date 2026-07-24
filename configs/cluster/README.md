@@ -82,6 +82,7 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `enable_attn_offloading` | Boolean | No | Per-instance override for `--enable-attn-offloading` |
 | `enable_sub_batch_interleaving` | Boolean | No | Per-instance override for `--enable-sub-batch-interleaving` |
 | `enable_block_copy` | Boolean | No | Per-instance override for `--enable-block-copy` |
+| `performance_profile` | Object | No | Static memory-scenario Profile selection; omitted means legacy HBM-only lookup |
 
 \* At least one of `num_npus` or `tp_size` must be provided. The other is inferred.
 
@@ -103,6 +104,64 @@ Setting a numeric field to `0` means "unlimited" (via the `_runtime_limit` helpe
 
 **Validation gates:**
 - `enable_sub_batch_interleaving: true` requires `enable_attn_offloading: true` (enforced at config load time)
+
+### Static memory-scenario Profile
+
+Profile v2 selects one measured memory scenario for every operator lookup:
+
+```json
+{
+  "model_name": "Qwen/Qwen3-32B",
+  "hardware": "RTXPRO6000",
+  "performance_profile": {
+    "mode": "memory_scenario_v2",
+    "memory_profile_id": "cli-a",
+    "scenario_policy": {
+      "default": "all_hbm",
+      "layers": {
+        "lm_head": "weights_hbf"
+      },
+      "blocks": [
+        {
+          "blocks": "0-3,8",
+          "scenario": "weights_and_kv_hbf"
+        }
+      ]
+    }
+  }
+}
+```
+
+`memory_profile_id` selects
+`profiler/perf/<hardware>/<model>/<variant>/<memory_profile_id>/`.
+Every scenario name must be an exact entry in that bundle's
+`meta.yaml::scenario_catalog`. Layer keys must be exact members of the active
+architecture catalog; wildcard and inferred names are not accepted. Selection
+precedence is `layers` > `blocks` > `default`. Block ranges are inclusive,
+zero-based, bounds-checked, and cannot overlap. A block override forces
+per-block trace construction; layer-only policies may still reuse one
+transformer-block trace.
+
+Profile v2 is incompatible with the legacy demand-access paths below:
+
+- `enable_local_offloading: true`
+- `enable_attn_offloading: true`
+- `enable_sub_batch_interleaving: true`
+- a normalized `placement` whose `weights` or `kv_loc` is not `LOCAL`
+
+`kv_evict_loc` may remain non-local because explicit KV load/evict traffic is
+still modeled separately. Ordinary weight and KV demand traffic must remain
+`LOCAL` and must not create extra memory nodes: the selected Profile v2
+`time_us` already includes compute plus HBM/HBF demand-access latency. Existing
+request-input/result-output boundaries are unchanged. Migration, prefetch,
+eviction, and network collectives remain excluded from that latency and retain
+their existing explicit models. This is the single-accounting boundary that
+prevents HBF demand latency from being charged twice.
+
+The policy is static metadata, not a capacity or residency proof. The runtime
+does not infer placement from scenario names and does not prove that the chosen
+HBM/HBF contents fit at every step. Capacity/residency validation must be
+performed by the scenario producer or a separate constraint layer.
 
 **Example: heterogeneous P/D instances**
 

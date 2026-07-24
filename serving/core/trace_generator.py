@@ -16,6 +16,10 @@ from .profile_contract import (
     load_profile_contract,
     validate_memory_profile_id,
 )
+from .memory_scenario import (
+    MemoryScenarioPolicy,
+    parse_instance_performance_profile,
+)
 import bisect
 from dataclasses import dataclass, field
 
@@ -140,6 +144,7 @@ class TraceCtx:
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
+    memory_scenario_policy: object = None
 
 
 @dataclass
@@ -1100,19 +1105,92 @@ def _catalog_has(perf_db, category, name):
 # Context builders
 # ======================================================================
 
+def _validate_policy_against_profile(policy, perf_db):
+    """在创建 TraceCtx 前验证静态策略引用的场景与层。"""
+    if not isinstance(policy, MemoryScenarioPolicy):
+        raise TypeError("memory_scenario_policy 必须是 MemoryScenarioPolicy")
+    if not policy.is_v2:
+        return
+    if not _is_profile_v2(perf_db):
+        raise RuntimeError("memory_scenario_v2 策略必须加载 Profile v2 bundle")
+
+    scenario_catalog = perf_db.get("scenario_catalog") or {}
+    referenced_scenarios = {
+        policy.default_scenario,
+        *policy.layer_scenarios.values(),
+        *policy.block_scenarios.values(),
+    }
+    unknown_scenarios = sorted(referenced_scenarios - set(scenario_catalog))
+    if unknown_scenarios:
+        raise KeyError(
+            f"scenario_policy 引用了未知 memory_scenario：{unknown_scenarios}；"
+            f"可用场景：{sorted(scenario_catalog)}"
+        )
+
+    architecture_catalog = perf_db["architecture"].get("catalog") or {}
+    canonical_layers = {
+        layer_name
+        for category in architecture_catalog.values()
+        for layer_name in (category or {})
+    }
+    unknown_layers = sorted(set(policy.layer_scenarios) - canonical_layers)
+    if unknown_layers:
+        raise KeyError(
+            f"scenario_policy.layers 不是当前 architecture catalog 的精确成员："
+            f"{unknown_layers}"
+        )
+
+
+def _scenario_for(ctx, layer_name, layer_num):
+    """统一解析每次 Profile 查询使用的静态场景。"""
+    policy = ctx.memory_scenario_policy
+    if policy is None:
+        return None
+    return policy.scenario_for(layer_name, layer_num)
+
 def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                     memory_scenario_policy=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
             f"Model config for {model!r} has no 'model_type'; cannot locate "
             f"profiler/models/<model_type>.yaml"
         )
+    if memory_scenario_policy is None:
+        memory_scenario_policy = parse_instance_performance_profile(
+            {},
+            config["num_hidden_layers"],
+        )
+    elif not isinstance(memory_scenario_policy, MemoryScenarioPolicy):
+        raise TypeError("memory_scenario_policy 必须是 MemoryScenarioPolicy")
+    if memory_scenario_policy.num_hidden_layers != config["num_hidden_layers"]:
+        raise ValueError(
+            "memory_scenario_policy.num_hidden_layers 与模型配置不一致"
+        )
+
     tp_needed = {max(int(tp_size), 1)}
-    perf_db = _load_perf_db(hardware, model, variant, tp_needed, model_type)
+    if memory_scenario_policy.is_v2:
+        perf_db = _load_perf_db(
+            hardware,
+            model,
+            variant,
+            tp_needed,
+            model_type,
+            memory_profile_id=memory_scenario_policy.memory_profile_id,
+        )
+    else:
+        perf_db = _load_perf_db(
+            hardware,
+            model,
+            variant,
+            tp_needed,
+            model_type,
+        )
+    _validate_policy_against_profile(memory_scenario_policy, perf_db)
     warn_if_runtime_exceeds_profiled(
         perf_db, runtime_max_num_batched_tokens, runtime_max_num_seqs)
 
@@ -1137,6 +1215,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        memory_scenario_policy=memory_scenario_policy,
     )
 
 
@@ -1206,17 +1285,31 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             f"profiler/models/<model_type>.yaml or remove it from the sequence."
         )
 
+    memory_scenario = _scenario_for(ctx, layer_name, layer_num)
     if category == "per_sequence":
-        latency_ns = _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
+        latency_ns = _lookup_per_sequence(
+            ctx.perf_db,
+            layer_name,
+            ctx.tp_size,
+            bctx.lm_head_len,
+            memory_scenario=memory_scenario,
+        )
     elif category == "attention":
         latency_ns = _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
             bctx.prefill_chunk, bctx.kv_prefill,
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
+            memory_scenario=memory_scenario,
         )
     else:  # dense
-        latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
+        latency_ns = _lookup_dense(
+            ctx.perf_db,
+            layer_name,
+            ctx.tp_size,
+            bctx.total_len,
+            memory_scenario=memory_scenario,
+        )
 
     # Size calculation uses the same canonical layer names.
     if layer_name == 'attention':
@@ -1332,6 +1425,7 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         combine_comm_size = 0
 
     wt_loc = get_device(ctx.placement, layer_num, "moe", "weights")
+    memory_scenario = _scenario_for(ctx, "moe", layer_num)
 
     # Each local GPU handles exactly one EP rank. The routing result already
     # accounts for cross-instance token redistribution (ALLTOALL), so
@@ -1356,7 +1450,12 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         activated_experts = routing.activated_experts[i]
 
         if local_tokens > 0:
-            rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
+            rank_latency_ns = _lookup_moe(
+                ctx.perf_db,
+                local_tokens,
+                max(activated_experts, 1),
+                memory_scenario=memory_scenario,
+            )
             rank_inp, rank_wt, rank_out = calculate_sizes(
                 ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
@@ -1497,7 +1596,13 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
             continue
         if layer_name == "rotary_emb" and "TPU" in ctx.hardware:
             continue
-        if not _layer_available(ctx.perf_db, ctx.tp_size, layer_name):
+        memory_scenario = _scenario_for(ctx, layer_name, layer_num)
+        if not _layer_available(
+            ctx.perf_db,
+            ctx.tp_size,
+            layer_name,
+            memory_scenario=memory_scenario,
+        ):
             key = (ctx.perf_db["variant"], ctx.perf_db["model"], layer_name)
             if ctx.perf_db.get("memory_profile_id") is not None:
                 key = (
@@ -1505,6 +1610,7 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
                     ctx.perf_db["model"],
                     ctx.perf_db["memory_profile_id"],
                     layer_name,
+                    memory_scenario,
                 )
             if key not in _skipped_layer_warned:
                 _skipped_layer_warned.add(key)
@@ -1558,21 +1664,35 @@ def _build_transformer_block(ctx, bctx, layer_num, batch_tag, batch_id_str):
 # Final layers and power helpers
 # ======================================================================
 
-def _layer_latency_for_power(ctx, bctx, layer_name):
+def _layer_latency_for_power(ctx, bctx, layer_name, layer_num=None):
     """Per-layer latency lookup used purely for power accounting; the
     trace writes its own values via _emit_layer and _emit_moe_block.
     """
     category = _layer_category(ctx.perf_db, layer_name)
+    memory_scenario = _scenario_for(ctx, layer_name, layer_num)
     if category == "per_sequence":
-        return _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
+        return _lookup_per_sequence(
+            ctx.perf_db,
+            layer_name,
+            ctx.tp_size,
+            bctx.lm_head_len,
+            memory_scenario=memory_scenario,
+        )
     if category == "attention":
         return _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
             bctx.prefill_chunk, bctx.kv_prefill,
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
+            memory_scenario=memory_scenario,
         )
-    return _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
+    return _lookup_dense(
+        ctx.perf_db,
+        layer_name,
+        ctx.tp_size,
+        bctx.total_len,
+        memory_scenario=memory_scenario,
+    )
 
 
 def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
@@ -1642,13 +1762,19 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                      memory_scenario_policy=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           memory_scenario_policy=memory_scenario_policy)
+    block_mode_on = bool(
+        block_mode_on
+        or ctx.memory_scenario_policy.requires_per_block_trace
+    )
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1695,13 +1821,19 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                                  memory_scenario_policy=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           memory_scenario_policy=memory_scenario_policy)
+    block_mode_on = bool(
+        block_mode_on
+        or ctx.memory_scenario_policy.requires_per_block_trace
+    )
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1790,16 +1922,36 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 # generate_trace() — public entry point
 # ======================================================================
 
+def _effective_block_mode(block_mode_on, memory_scenario_policy):
+    """block 覆盖存在时必须逐层构建，避免复用第 0 层的场景。"""
+    return bool(
+        block_mode_on
+        or memory_scenario_policy.requires_per_block_trace
+    )
+
+
 # Wrapper function that creates trace for an instance
 def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
                    max_num_batched_tokens=2048, max_num_seqs=None,
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
+                   memory_scenario_policy=None):
 
     model = batch.model
     config = get_config(model)
+    if memory_scenario_policy is None:
+        memory_scenario_policy = parse_instance_performance_profile(
+            {},
+            config["num_hidden_layers"],
+        )
+    elif not isinstance(memory_scenario_policy, MemoryScenarioPolicy):
+        raise TypeError("memory_scenario_policy 必须是 MemoryScenarioPolicy")
+    block_mode_on = _effective_block_mode(
+        block_mode_on,
+        memory_scenario_policy,
+    )
     fp = fp // 8  # bit -> byte of floating point
     max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
     variant = resolve_variant(dtype, kv_cache_dtype, config)
@@ -1847,7 +1999,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
-                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                        memory_scenario_policy=memory_scenario_policy)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:
