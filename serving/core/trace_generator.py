@@ -2632,6 +2632,65 @@ def _effective_block_mode(block_mode_on, memory_scenario_policy):
     )
 
 
+def _tier_location(tier):
+    if tier is MemoryTier.HBM:
+        return "LOCAL"
+    if tier is MemoryTier.HBF:
+        return "HBF"
+    if tier is MemoryTier.CPU:
+        return "REMOTE"
+    if tier is MemoryTier.CXL:
+        return "CXL"
+    raise TypeError("迁移层级必须是 MemoryTier")
+
+
+def _tier_transfer_rows(batch):
+    """把策略迁移事件编码为 Chakra 可识别的源读、目标写行。"""
+
+    rows = []
+    for index, operation in enumerate(
+        getattr(batch, "memory_transfers", ()) or ()
+    ):
+        source = operation.source
+        target = operation.target
+        size = getattr(
+            operation,
+            "bytes_per_rank",
+            getattr(operation, "total_bytes", None),
+        )
+        if source is target:
+            raise RuntimeError("显式迁移的 source 与 target 不能相同")
+        if isinstance(size, tuple):
+            if len(set(size)) != 1:
+                raise RuntimeError(
+                    "当前 ASTRA Trace 要求每个 rank 的迁移字节数一致"
+                )
+            size = size[0]
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+        ):
+            raise RuntimeError("显式迁移字节数必须是正整数")
+        transfer_id = getattr(operation, "transfer_id", index)
+        rows.append(
+            [
+                f"tier_transfer_{transfer_id}",
+                "0",
+                _tier_location(source),
+                str(size),
+                "LOCAL",
+                "0",
+                _tier_location(target),
+                str(size),
+                "NONE",
+                "0",
+                "NONE",
+            ]
+        )
+    return rows
+
+
 # Wrapper function that creates trace for an instance
 def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
                    max_num_batched_tokens=2048, max_num_seqs=None,
@@ -2651,6 +2710,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         )
     elif not isinstance(memory_scenario_policy, MemoryScenarioPolicy):
         raise TypeError("memory_scenario_policy 必须是 MemoryScenarioPolicy")
+    if memory_view is None:
+        memory_view = getattr(batch, "memory_view", None)
     block_mode_on = _effective_block_mode(
         block_mode_on,
         memory_scenario_policy,
@@ -2737,7 +2798,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     if power_model is not None:
         power_model.print_log(node_id)
 
-    result = mem + dic
+    result = _tier_transfer_rows(batch) + mem + dic
 
     with open(output_path, 'w') as f:
         # instance type

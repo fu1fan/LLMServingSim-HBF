@@ -6,6 +6,7 @@ from serving.core.residency_scenario import BatchMemoryView
 from serving.core.trace_generator import (
     BatchCtx,
     _attention_residency_groups,
+    _tier_transfer_rows,
 )
 
 
@@ -19,6 +20,39 @@ class _Request:
 
 
 class ResidencyTraceTest(unittest.TestCase):
+    def test_explicit_transfer_encodes_source_read_and_target_write(self):
+        batch = SimpleNamespace(
+            memory_transfers=(
+                SimpleNamespace(
+                    transfer_id=9,
+                    source=MemoryTier.HBF,
+                    target=MemoryTier.HBM,
+                    bytes_per_rank=4096,
+                ),
+            )
+        )
+
+        rows = _tier_transfer_rows(batch)
+
+        self.assertEqual(rows[0][0], "tier_transfer_9")
+        self.assertEqual(rows[0][2:4], ["HBF", "4096"])
+        self.assertEqual(rows[0][6:8], ["LOCAL", "4096"])
+
+    def test_uneven_rank_transfer_is_rejected(self):
+        batch = SimpleNamespace(
+            memory_transfers=(
+                SimpleNamespace(
+                    transfer_id=1,
+                    source=MemoryTier.HBM,
+                    target=MemoryTier.HBF,
+                    bytes_per_rank=(1024, 2048),
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "每个 rank"):
+            _tier_transfer_rows(batch)
+
     def test_attention_is_grouped_by_request_layer_residency(self):
         batch = SimpleNamespace(
             requests=[_Request(10, True), _Request(11, False)],
