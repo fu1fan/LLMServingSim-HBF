@@ -28,6 +28,7 @@ class ResidencyTraceTest(unittest.TestCase):
                     source=MemoryTier.HBF,
                     target=MemoryTier.HBM,
                     bytes_per_rank=4096,
+                    pp_stage=1,
                 ),
             )
         )
@@ -37,6 +38,7 @@ class ResidencyTraceTest(unittest.TestCase):
         self.assertEqual(rows[0][0], "tier_transfer_9")
         self.assertEqual(rows[0][2:4], ["HBF", "4096"])
         self.assertEqual(rows[0][6:8], ["LOCAL", "4096"])
+        self.assertEqual(rows[0][10], "PP_STAGE:1")
 
     def test_uneven_rank_transfer_is_rejected(self):
         batch = SimpleNamespace(

@@ -2672,6 +2672,13 @@ def _tier_transfer_rows(batch):
             or size <= 0
         ):
             raise RuntimeError("显式迁移字节数必须是正整数")
+        pp_stage = getattr(operation, "pp_stage", None)
+        if pp_stage is not None and (
+            isinstance(pp_stage, bool)
+            or not isinstance(pp_stage, int)
+            or pp_stage < 0
+        ):
+            raise RuntimeError("显式迁移的 pp_stage 必须是非负整数")
         transfer_id = getattr(operation, "transfer_id", index)
         rows.append(
             [
@@ -2685,7 +2692,11 @@ def _tier_transfer_rows(batch):
                 str(size),
                 "NONE",
                 "0",
-                "NONE",
+                (
+                    "NONE"
+                    if pp_stage is None
+                    else f"PP_STAGE:{pp_stage}"
+                ),
             ]
         )
     return rows

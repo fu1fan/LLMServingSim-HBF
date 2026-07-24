@@ -43,13 +43,22 @@ def _tiering(*, weights=None, kv=None, prefix=None, hbf_gb=1):
     )
 
 
-def _memory(config=None, *, npu_gb=1, prefix=False, engine=None):
+def _memory(
+    config=None,
+    *,
+    npu_gb=1,
+    prefix=False,
+    engine=None,
+    num_npus=1,
+    tp_size=1,
+    pp_size=1,
+):
     return MemoryModel(
         "test-model",
         0,
         0,
-        1,
-        1,
+        num_npus,
+        tp_size,
         npu_gb,
         1,
         16,
@@ -58,6 +67,7 @@ def _memory(config=None, *, npu_gb=1, prefix=False, engine=None):
         False,
         None,
         None,
+        pp_size=pp_size,
         memory_tiering=config,
         kv_policy_engine=engine,
     )
@@ -248,6 +258,82 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         self.assertGreater(
             stats.resident_high_water_bytes[MemoryTier.HBF][0],
             memory.hbf_weight,
+        )
+
+    def test_pp_kv_is_charged_only_to_the_owning_tp_ranks(self):
+        model_config = {
+            **_MODEL_CONFIG,
+            "num_hidden_layers": 5,
+            "num_key_value_heads": 2,
+        }
+        config = parse_instance_memory_tiering(
+            {
+                "hbf_mem": {"mem_size": 1},
+                "performance_profile": {
+                    "mode": "memory_scenario_v2",
+                    "scenario_selection": "residency_derived",
+                },
+                "memory_tiering": {
+                    "kv": {
+                        "policy": "length_threshold",
+                        "threshold_tokens": 32,
+                    }
+                },
+            },
+            model_config["num_hidden_layers"],
+        )
+        with patch.object(
+            memory_model_module,
+            "get_config",
+            return_value=model_config,
+        ):
+            memory = _memory(
+                config,
+                num_npus=4,
+                tp_size=2,
+                pp_size=2,
+            )
+
+        req = Request(12, "test-model", 16, 64, 0, 0)
+        first = memory.plan_kv_allocation(
+            [req],
+            scheduled_tokens={12: 16},
+        )
+
+        # 五层按 3+2 分到两个 PP stage；每层只在所属 stage 的两个 TP rank 上。
+        self.assertEqual(
+            first.used_delta[Device.NPU],
+            (384, 384, 256, 256),
+        )
+        memory.apply_kv_plan(first)
+        req.num_computed_tokens = 16
+
+        crossing = memory.plan_kv_allocation(
+            [req],
+            scheduled_tokens={12: 16},
+        )
+        self.assertEqual(
+            crossing.used_delta[Device.NPU],
+            (-384, -384, -256, -256),
+        )
+        self.assertEqual(
+            crossing.used_delta[Device.HBF],
+            (768, 768, 512, 512),
+        )
+        self.assertEqual(
+            [event.pp_stage for event in crossing.transfers],
+            [0, 0, 0, 1, 1],
+        )
+
+        memory.apply_kv_plan(crossing)
+        memory.release_request_kv(req)
+        self.assertEqual(
+            memory._hbm_used_by_rank,
+            list(memory._hbm_weight_by_rank),
+        )
+        self.assertEqual(
+            memory._hbf_used_by_rank,
+            list(memory._hbf_weight_by_rank),
         )
 
     def test_hbf_capacity_check_is_independent_from_hbm(self):

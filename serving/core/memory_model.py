@@ -37,6 +37,7 @@ class KVTransferEvent:
 
     request_id: str
     layer_index: int
+    pp_stage: int
     source: MemoryTier
     target: MemoryTier
     bytes_per_rank: int
@@ -77,6 +78,10 @@ class MemoryModel():
             memory_tiering is not None and memory_tiering.enabled
         )
         self.kv_policy_engine = kv_policy_engine
+        if self.tiering_enabled and self.num_npus != self.tp_size * self.pp_size:
+            raise RuntimeError(
+                "HBF 分层分账要求 num_npus == tp_size * pp_size"
+            )
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -304,6 +309,21 @@ class MemoryModel():
         count = base + (1 if stage < remainder else 0)
         return range(start, start + count)
 
+    def _pipeline_stage(self, layer_index):
+        """返回 transformer layer 实际所属的 PP stage。"""
+
+        for stage in range(max(self.pp_size, 1)):
+            if layer_index in self._pipeline_blocks(stage):
+                return stage
+        raise RuntimeError(f"transformer layer {layer_index} 未分配到 PP stage")
+
+    def _pipeline_rank_ids(self, layer_index):
+        """KV 只占用所属 PP stage 内的 TP ranks。"""
+
+        stage = self._pipeline_stage(layer_index)
+        first = stage * self.tp_size
+        return stage, range(first, first + self.tp_size)
+
     def _init_tiered_weight_accounting(self):
         """按真实 canonical 层和 PP block 为每个 rank 分账。"""
 
@@ -378,9 +398,9 @@ class MemoryModel():
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
 
     def get_layer_kv(self, seq):
-        """单个请求、单层、单 rank 的 K/V 合计字节数。"""
+        """单请求单层在所属 PP stage 的每个 TP rank 上的 KV 字节。"""
 
-        return 2 * self.kv_dim * seq * self.kv_fp // self.num_npus
+        return 2 * self.kv_dim * seq * self.kv_fp // self.tp_size
 
     @staticmethod
     def _device_for_tier(tier):
@@ -448,8 +468,11 @@ class MemoryModel():
         if len({str(req.id) for req in requests}) != len(requests):
             raise RuntimeError("同一 KV 事务不能重复包含 request")
 
-        delta = {Device.NPU: 0, Device.HBF: 0}
-        growth = 0
+        delta = {
+            Device.NPU: [0] * self.num_npus,
+            Device.HBF: [0] * self.num_npus,
+        }
+        growth = [0] * self.num_npus
         records = []
         transfers = []
         for req in requests:
@@ -468,30 +491,36 @@ class MemoryModel():
             target = self._select_kv_tier(req, projected)
             target_device = self._device_for_tier(target)
             for layer_index in range(self.n_layer):
+                pp_stage, rank_ids = self._pipeline_rank_ids(layer_index)
+                rank_ids = tuple(rank_ids)
                 key = (str(req.id), layer_index)
                 current = self._kv_records.get(key)
                 desired_bytes = self.get_layer_kv(aligned)
                 if desired_bytes == 0:
                     continue
                 if current is None:
-                    delta[target_device] += desired_bytes
-                    growth += desired_bytes
+                    for rank in rank_ids:
+                        delta[target_device][rank] += desired_bytes
+                        growth[rank] += desired_bytes
                 elif current.tier is target:
                     change = desired_bytes - current.bytes_per_rank
-                    delta[target_device] += change
-                    growth += max(change, 0)
+                    for rank in rank_ids:
+                        delta[target_device][rank] += change
+                        growth[rank] += max(change, 0)
                 else:
                     source_device = self._device_for_tier(current.tier)
-                    delta[source_device] -= current.bytes_per_rank
-                    delta[target_device] += desired_bytes
-                    growth += max(
-                        desired_bytes - current.bytes_per_rank,
-                        0,
-                    )
+                    for rank in rank_ids:
+                        delta[source_device][rank] -= current.bytes_per_rank
+                        delta[target_device][rank] += desired_bytes
+                        growth[rank] += max(
+                            desired_bytes - current.bytes_per_rank,
+                            0,
+                        )
                     transfers.append(
                         KVTransferEvent(
                             request_id=str(req.id),
                             layer_index=layer_index,
+                            pp_stage=pp_stage,
                             source=current.tier,
                             target=target,
                             bytes_per_rank=current.bytes_per_rank,
@@ -512,8 +541,13 @@ class MemoryModel():
             base_version=self._kv_version,
             records=tuple(records),
             removed_keys=(),
-            used_delta=MappingProxyType(delta),
-            growth_bytes_per_rank=growth,
+            used_delta=MappingProxyType(
+                {
+                    device: tuple(values)
+                    for device, values in delta.items()
+                }
+            ),
+            growth_bytes_per_rank=max(growth, default=0),
             transfers=tuple(transfers),
         )
 
@@ -526,8 +560,10 @@ class MemoryModel():
             (Device.NPU, self._hbm_used_by_rank, self.npu_mem),
             (Device.HBF, self._hbf_used_by_rank, self.hbf_mem),
         ):
-            change = plan.used_delta[device]
-            for rank_used in used:
+            changes = plan.used_delta[device]
+            if len(changes) != self.num_npus:
+                return False
+            for rank_used, change in zip(used, changes):
                 if rank_used + change < 0 or rank_used + change > capacity:
                     return False
         return True
@@ -545,8 +581,7 @@ class MemoryModel():
             (Device.NPU, self._hbm_used_by_rank),
             (Device.HBF, self._hbf_used_by_rank),
         ):
-            change = plan.used_delta[device]
-            for rank in range(len(used)):
+            for rank, change in enumerate(plan.used_delta[device]):
                 used[rank] += change
         for key in plan.removed_keys:
             self._kv_records.pop(key, None)
@@ -574,11 +609,11 @@ class MemoryModel():
         return plan.transfers
 
     def release_request_kv(self, req):
-        """释放一个请求的全部层 KV，返回各 tier 的单 rank 字节数。"""
+        """释放请求全部层 KV，返回各 tier 的最大单 rank 字节数。"""
 
         released = {
-            MemoryTier.HBM: 0,
-            MemoryTier.HBF: 0,
+            MemoryTier.HBM: [0] * self.num_npus,
+            MemoryTier.HBF: [0] * self.num_npus,
         }
         prefix = str(req.id)
         keys = [
@@ -588,22 +623,29 @@ class MemoryModel():
         ]
         for key in keys:
             record = self._kv_records.pop(key)
-            released[record.tier] += record.bytes_per_rank
-        for tier, size in released.items():
-            if size == 0:
+            _, rank_ids = self._pipeline_rank_ids(record.layer_index)
+            for rank in rank_ids:
+                released[record.tier][rank] += record.bytes_per_rank
+        for tier, sizes in released.items():
+            if not any(sizes):
                 continue
             used = (
                 self._hbm_used_by_rank
                 if tier is MemoryTier.HBM
                 else self._hbf_used_by_rank
             )
-            for rank in range(len(used)):
+            for rank, size in enumerate(sizes):
                 used[rank] -= size
         if keys:
             self._kv_version += 1
             self._sync_accelerator_usage()
             self._observe_tiering_usage()
-        return MappingProxyType(released)
+        return MappingProxyType(
+            {
+                tier: max(sizes, default=0)
+                for tier, sizes in released.items()
+            }
+        )
 
     def take_kv_transfer_events(self):
         events = tuple(self._kv_transfer_events)
@@ -616,10 +658,14 @@ class MemoryModel():
         if self.tiering_stats is None:
             return
         for event in events:
+            rank_bytes = [0] * self.num_npus
+            first = event.pp_stage * self.tp_size
+            for rank in range(first, first + self.tp_size):
+                rank_bytes[rank] = event.bytes_per_rank
             self.tiering_stats.record_explicit_transfer(
                 source=event.source,
                 target=event.target,
-                bytes_per_rank=(event.bytes_per_rank,) * self.num_npus,
+                bytes_per_rank=tuple(rank_bytes),
                 reason=event.reason,
                 object_kind=MemoryObjectKind.KV,
                 layer_index=event.layer_index,
