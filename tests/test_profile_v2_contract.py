@@ -8,7 +8,6 @@ import yaml
 
 from serving.core.profile_contract import (
     ProfileContractError,
-    ProfileV2RuntimeNotReadyError,
     load_profile_contract,
     validate_profile_meta,
 )
@@ -347,7 +346,7 @@ class ProfileV2ContractTest(unittest.TestCase):
             ("gpu", "model", "bf16", "cli-a"),
         )
 
-    def test_runtime_load_rejects_valid_v2_until_scenario_lookup_exists(self):
+    def test_runtime_load_accepts_valid_v2_lookup_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             profiler_root = Path(tmp) / "profiler"
             bundle = (
@@ -366,22 +365,29 @@ class ProfileV2ContractTest(unittest.TestCase):
                 "_PROFILER_ROOT_REL",
                 str(profiler_root),
             ):
-                with self.assertRaisesRegex(
-                    ProfileV2RuntimeNotReadyError,
-                    "scenario-aware lookup",
-                ):
-                    trace_generator._load_perf_db(
-                        "gpu",
-                        "org/model",
-                        "bf16",
-                        {1},
-                        "llama",
-                        memory_profile_id="cli-a",
-                    )
+                perf_db = trace_generator._load_perf_db(
+                    "gpu",
+                    "org/model",
+                    "bf16",
+                    {1},
+                    "llama",
+                    memory_profile_id="cli-a",
+                )
 
-        self.assertNotIn(
+        self.assertEqual(perf_db["profile_schema_version"], 2)
+        self.assertIn(
             ("gpu", "org/model", "bf16", "cli-a"),
             trace_generator._perf_db_cache,
+        )
+        self.assertEqual(
+            trace_generator._lookup_dense(
+                perf_db,
+                "qkv_proj",
+                1,
+                128,
+                memory_scenario="all_hbm",
+            ),
+            12500,
         )
 
     def test_legacy_v1_runtime_load_and_cache_key_remain_usable(self):

@@ -352,6 +352,45 @@ def _build_moe_table(df):
             "rows": [tokens_by_experts[a] for a in ae_vals]}
 
 
+def _build_scenario_1d_table(df, layer_col, key_col):
+    """构建 layer -> scenario -> 1D table，scenario 不参与插值。"""
+    df = df.copy()
+    df["memory_scenario"] = df["memory_scenario"].astype(str).str.strip()
+    df[layer_col] = df[layer_col].astype(str).str.strip()
+    out = {}
+    for scenario, scenario_rows in df.groupby("memory_scenario"):
+        by_layer = _build_1d_table(scenario_rows, layer_col, key_col)
+        for layer, table in by_layer.items():
+            out.setdefault(layer, {})[str(scenario)] = table
+    return out
+
+
+def _build_scenario_attention_table(df):
+    """构建 scenario -> 4D attention table。"""
+    df = df.copy()
+    df["memory_scenario"] = df["memory_scenario"].astype(str).str.strip()
+    return {
+        str(scenario): _build_attention_table(scenario_rows)
+        for scenario, scenario_rows in df.groupby("memory_scenario")
+    }
+
+
+def _build_scenario_moe_table(df):
+    """构建 scenario -> 2D MoE table。"""
+    df = df.copy()
+    df["memory_scenario"] = df["memory_scenario"].astype(str).str.strip()
+    return {
+        str(scenario): _build_moe_table(scenario_rows)
+        for scenario, scenario_rows in df.groupby("memory_scenario")
+    }
+
+
+def _v2_skew_enabled(meta):
+    skew_profile = (meta or {}).get("skew_profile") or {}
+    skew_fit = (meta or {}).get("skew_fit") or {}
+    return bool(skew_profile.get("enabled") or skew_fit.get("enabled"))
+
+
 def _load_perf_db(hardware, model, variant, tp_needed, model_type,
                   memory_profile_id=None):
     """Load the per-category perf DB for a (hardware, model, variant)
@@ -386,15 +425,16 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
         root,
         requested_memory_profile_id=memory_profile_id,
     )
-    if contract.is_v2:
-        # lookup 尚未接收 scenario；在此硬拒绝，避免静默混用不同放置场景。
+    if contract.is_v2 and _v2_skew_enabled(contract.meta):
+        # v2 skew 尚无稳定的场景化数据契约，不能复用 v1 的共享 alpha。
         raise ProfileV2RuntimeNotReadyError(
-            f"Profile v2 bundle {root} 已通过静态契约校验，但 "
-            "scenario-aware lookup 尚未接线，当前拒绝运行时加载"
+            f"Profile v2 bundle {root} 启用了 skew，但当前 skew 数据与 "
+            "lookup 尚未按 memory_scenario 隔离；请禁用 skew"
         )
 
     meta = contract.meta
-    _hydrate_skew_fit_tables(meta, root)
+    if not contract.is_v2:
+        _hydrate_skew_fit_tables(meta, root)
     arch = _load_architecture(model_type)
     tables_per_tp = {}
     available_tps = []
@@ -410,19 +450,47 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
 
         dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None)
         if dense_df is not None:
-            tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
+            if contract.is_v2:
+                tables["dense"] = _build_scenario_1d_table(
+                    dense_df,
+                    "layer",
+                    "tokens",
+                )
+            else:
+                tables["dense"] = _build_1d_table(
+                    dense_df,
+                    "layer",
+                    "tokens",
+                )
 
         per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None)
         if per_seq_df is not None:
-            tables["per_sequence"] = _build_1d_table(per_seq_df, "layer", "sequences")
+            if contract.is_v2:
+                tables["per_sequence"] = _build_scenario_1d_table(
+                    per_seq_df,
+                    "layer",
+                    "sequences",
+                )
+            else:
+                tables["per_sequence"] = _build_1d_table(
+                    per_seq_df,
+                    "layer",
+                    "sequences",
+                )
 
         attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
         if attn_df is not None:
-            tables["attention"] = _build_attention_table(attn_df)
+            if contract.is_v2:
+                tables["attention"] = _build_scenario_attention_table(attn_df)
+            else:
+                tables["attention"] = _build_attention_table(attn_df)
 
         moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
         if moe_df is not None:
-            tables["moe"] = _build_moe_table(moe_df)
+            if contract.is_v2:
+                tables["moe"] = _build_scenario_moe_table(moe_df)
+            else:
+                tables["moe"] = _build_moe_table(moe_df)
 
         tables_per_tp[tp] = tables
         available_tps.append(tp)
@@ -433,6 +501,9 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
         "variant": variant,
         "hardware": hardware,
         "model": model,
+        "profile_schema_version": contract.schema_version,
+        "memory_profile_id": contract.memory_profile_id,
+        "scenario_catalog": contract.scenario_catalog,
         "available_tps": sorted(available_tps),
         "tables": tables_per_tp,
     }
@@ -444,9 +515,13 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
 def _check_tp_coverage(perf_db, tp_needed, hardware, model, variant):
     missing = sorted(set(tp_needed) - set(perf_db["available_tps"]))
     if missing:
+        profile_suffix = ""
+        if perf_db.get("memory_profile_id") is not None:
+            profile_suffix = f"/{perf_db['memory_profile_id']}"
         raise FileNotFoundError(
             f"No profile data for tp={missing} under "
-            f"perf/{hardware}/{model}/{variant}/. Re-run the profiler with "
+            f"perf/{hardware}/{model}/{variant}{profile_suffix}/. "
+            f"Re-run the profiler with "
             f"TP_DEGREES including {','.join(str(t) for t in missing)}."
         )
 
@@ -462,6 +537,8 @@ def warn_if_runtime_exceeds_profiled(perf_db, runtime_max_num_batched_tokens,
     p_tok = eff.get("max_num_batched_tokens")
     p_seqs = eff.get("max_num_seqs")
     key = ("warned", perf_db["hardware"], perf_db["model"], perf_db["variant"])
+    if perf_db.get("memory_profile_id") is not None:
+        key = (*key, perf_db["memory_profile_id"])
     if _perf_db_cache.get(key):
         return
     _perf_db_cache[key] = True
@@ -546,34 +623,142 @@ def _tp_stable(perf_db, category, name):
     return bool(entry.get("tp_stable"))
 
 
-def _effective_tp(perf_db, category, name, tp):
+_LEGACY_MEMORY_SCENARIO = object()
+
+
+def _effective_tp(
+    perf_db,
+    category,
+    name,
+    tp,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
     """Layers marked ``tp_stable`` in the architecture yaml are profiled
     once at tp=1 and the writer replicates them across TP folders, so
     either lookup works. Using the current TP keeps things uniform.
     """
     if _tp_stable(perf_db, category, name) and 1 in perf_db["available_tps"]:
+        if _is_profile_v2(perf_db):
+            scenario = _resolve_memory_scenario(perf_db, memory_scenario)
+            tables = _tp_tables(perf_db, 1).get(category)
+            if category in ("dense", "per_sequence"):
+                tables = (tables or {}).get(name)
+            if not tables or scenario not in tables:
+                return tp
         return 1
     return tp
 
 
-def _lookup_dense(perf_db, name, tp, tokens):
-    tp_eff = _effective_tp(perf_db, "dense", name, tp)
-    tbl = _tp_tables(perf_db, tp_eff).get("dense", {}).get(name)
-    if tbl is None:
+def _is_profile_v2(perf_db):
+    version = perf_db.get("profile_schema_version")
+    if version is None:
+        version = (perf_db.get("meta") or {}).get("profile_schema_version", 1)
+    return version == 2
+
+
+def _resolve_memory_scenario(perf_db, memory_scenario):
+    """v2 必须显式选择 catalog 场景；v1 保持无场景调用。"""
+    if not _is_profile_v2(perf_db):
+        if memory_scenario in (_LEGACY_MEMORY_SCENARIO, None):
+            return _LEGACY_MEMORY_SCENARIO
+        raise KeyError("Profile v1 不支持 memory_scenario")
+
+    if memory_scenario in (_LEGACY_MEMORY_SCENARIO, None):
+        raise KeyError("Profile v2 lookup 必须显式提供 memory_scenario")
+    if not isinstance(memory_scenario, str) or not memory_scenario:
+        raise KeyError("memory_scenario 必须是非空字符串")
+
+    catalog = perf_db.get("scenario_catalog")
+    if catalog is None:
+        catalog = (perf_db.get("meta") or {}).get("scenario_catalog") or {}
+    if memory_scenario not in catalog:
+        raise KeyError(
+            f"未知 memory_scenario={memory_scenario!r}；"
+            f"可用场景：{sorted(catalog)}"
+        )
+    return memory_scenario
+
+
+def _select_scenario_table(
+    perf_db,
+    scenario_tables,
+    memory_scenario,
+    *,
+    category,
+    layer_name=None,
+):
+    """从 v2 离散场景表中取值；v1 直接返回原表。"""
+    scenario = _resolve_memory_scenario(perf_db, memory_scenario)
+    if scenario is _LEGACY_MEMORY_SCENARIO:
+        return scenario_tables
+    table = scenario_tables.get(scenario)
+    if table is None:
+        layer = f", layer={layer_name}" if layer_name is not None else ""
+        raise KeyError(
+            f"Missing {category} profile for memory_scenario={scenario!r}"
+            f"{layer}."
+        )
+    return table
+
+
+def _lookup_dense(
+    perf_db,
+    name,
+    tp,
+    tokens,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
+    tp_eff = _effective_tp(
+        perf_db,
+        "dense",
+        name,
+        tp,
+        memory_scenario,
+    )
+    scenario_tables = _tp_tables(perf_db, tp_eff).get("dense", {}).get(name)
+    if scenario_tables is None:
         raise KeyError(
             f"Missing dense profile for layer={name} on tp={tp_eff}. "
             f"Check that the architecture catalog and dense.csv agree."
         )
+    tbl = _select_scenario_table(
+        perf_db,
+        scenario_tables,
+        memory_scenario,
+        category="dense",
+        layer_name=name,
+    )
     return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(tokens), 1))))
 
 
-def _lookup_per_sequence(perf_db, name, tp, sequences):
-    tp_eff = _effective_tp(perf_db, "per_sequence", name, tp)
-    tbl = _tp_tables(perf_db, tp_eff).get("per_sequence", {}).get(name)
-    if tbl is None:
+def _lookup_per_sequence(
+    perf_db,
+    name,
+    tp,
+    sequences,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
+    tp_eff = _effective_tp(
+        perf_db,
+        "per_sequence",
+        name,
+        tp,
+        memory_scenario,
+    )
+    scenario_tables = (
+        _tp_tables(perf_db, tp_eff).get("per_sequence", {}).get(name)
+    )
+    if scenario_tables is None:
         raise KeyError(
             f"Missing per-sequence profile for layer={name} on tp={tp_eff}."
         )
+    tbl = _select_scenario_table(
+        perf_db,
+        scenario_tables,
+        memory_scenario,
+        category="per_sequence",
+        layer_name=name,
+    )
     return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
 
 
@@ -717,6 +902,7 @@ def _skew_alpha(
     skew_rate: float,
     kv_big: int,
     kp: int,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
 ) -> float:
     """Resolve alpha for a specific batch from the profile's
     ``skew_fit`` meta block.
@@ -732,10 +918,17 @@ def _skew_alpha(
         2. meta.yaml::skew_fit.per_tp[tp].alpha_default (pooled WLS).
         3. Module-level fallback constant (``_ATTN_SKEW_ALPHA_FALLBACK``).
 
-    Returns the fallback constant when the meta block is disabled or
-    missing.
+    v1 在配置缺失或禁用时沿用历史 fallback；v2 禁用时返回 0，
+    避免把同一个 alpha 跨场景复用。
     """
+    _resolve_memory_scenario(perf_db, memory_scenario)
     meta = perf_db.get("meta") if isinstance(perf_db, dict) else None
+    if _is_profile_v2(perf_db):
+        if not _v2_skew_enabled(meta):
+            return 0.0
+        raise ProfileV2RuntimeNotReadyError(
+            "Profile v2 skew 尚未按 memory_scenario 隔离，拒绝复用 v1 alpha"
+        )
     if not meta:
         return _ATTN_SKEW_ALPHA_FALLBACK
     fit_block = meta.get("skew_fit")
@@ -765,6 +958,7 @@ def _skew_alpha(
 def _lookup_attention_with_skew(
     perf_db, tp, prefill_chunk, kv_prefill,
     n_decode, kv_decode_mean, kv_decode_max, kv_decode_min,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
 ):
     """Attention lookup with skew correction applied.
 
@@ -781,6 +975,7 @@ def _lookup_attention_with_skew(
     """
     t_mean = _lookup_attention(
         perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_mean,
+        memory_scenario=memory_scenario,
     )
     # No skew → no correction (also saves a redundant lookup).
     if n_decode <= 1 or kv_decode_max == kv_decode_mean:
@@ -792,12 +987,13 @@ def _lookup_attention_with_skew(
     skew_rate = (kv_decode_mean - kv_decode_min) / kv_gap if kv_gap > 0 else 0.5
     alpha = _skew_alpha(
         perf_db, tp, prefill_chunk, n_decode, skew_rate, kv_decode_max,
-        kv_prefill,
+        kv_prefill, memory_scenario=memory_scenario,
     )
     if alpha == 0.0:
         return max(1, int(round(t_mean)))
     t_max = _lookup_attention(
         perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_max,
+        memory_scenario=memory_scenario,
     )
     # Guard against interpolation producing t_max < t_mean (can happen
     # at the axis boundary); in that case the formula would produce a
@@ -807,14 +1003,30 @@ def _lookup_attention_with_skew(
     return max(1, int(round(t_mean + alpha * (t_max - t_mean))))
 
 
-def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode):
+def _lookup_attention(
+    perf_db,
+    tp,
+    prefill_chunk,
+    kv_prefill,
+    n_decode,
+    kv_decode,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
     """4D log-linear interpolation on (prefill_chunk, kv_prefill,
     n_decode, kv_decode). Every axis is doubled by the profiler, so we
     bracket each axis's two nearest profiled values and blend linearly
     in log-space.
     """
-    tbl = _tp_tables(perf_db, tp).get("attention")
-    if tbl is None or not tbl["pc_nd_pairs"]:
+    scenario_tables = _tp_tables(perf_db, tp).get("attention")
+    if scenario_tables is None:
+        raise KeyError(f"Missing attention profile for tp={tp}.")
+    tbl = _select_scenario_table(
+        perf_db,
+        scenario_tables,
+        memory_scenario,
+        category="attention",
+    )
+    if not tbl["pc_nd_pairs"]:
         raise KeyError(f"Missing attention profile for tp={tp}.")
 
     pcq, ndq = max(int(prefill_chunk), 0), max(int(n_decode), 0)
@@ -844,17 +1056,28 @@ def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decod
     return max(1, int(out))
 
 
-def _lookup_moe(perf_db, tokens, activated_experts):
+def _lookup_moe(
+    perf_db,
+    tokens,
+    activated_experts,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
     """MoE is profiled once at tp=1 (single-rank view); the simulator
     looks up per EP-rank token counts.
     """
     tp_eff = 1 if 1 in perf_db["available_tps"] else perf_db["available_tps"][0]
-    tbl = _tp_tables(perf_db, tp_eff).get("moe")
-    if tbl is None:
+    scenario_tables = _tp_tables(perf_db, tp_eff).get("moe")
+    if scenario_tables is None:
         raise KeyError(
             f"Missing moe profile. Check that moe.csv exists under "
             f"perf/{perf_db['hardware']}/{perf_db['model']}/{perf_db['variant']}/tp{tp_eff}/."
         )
+    tbl = _select_scenario_table(
+        perf_db,
+        scenario_tables,
+        memory_scenario,
+        category="moe",
+    )
     ae_vals = tbl["activated_experts_vals"]
     rows = tbl["rows"]
     aeq = max(int(activated_experts), 1)
@@ -1171,24 +1394,89 @@ def _sequence(perf_db, section):
 _skipped_layer_warned = set()
 
 
-def _layer_available(perf_db, tp, layer_name):
+def _layer_available(
+    perf_db,
+    tp,
+    layer_name,
+    memory_scenario=_LEGACY_MEMORY_SCENARIO,
+):
     """Return True when the CSV-backed table has data for this layer at
     the TP the simulator is about to query. Attention/MoE are always
     present when their category CSVs exist.
     """
+    if _is_profile_v2(perf_db):
+        _resolve_memory_scenario(perf_db, memory_scenario)
     category = _layer_category(perf_db, layer_name)
     if category is None:
         return False
-    tp_eff = _effective_tp(perf_db, category, layer_name, tp)
+    tp_eff = _effective_tp(
+        perf_db,
+        category,
+        layer_name,
+        tp,
+        memory_scenario,
+    )
     tables = perf_db["tables"].get(tp_eff, {})
     if category == "dense":
-        return layer_name in tables.get("dense", {})
+        scenario_tables = tables.get("dense", {}).get(layer_name)
+        if scenario_tables is None:
+            if _is_profile_v2(perf_db):
+                raise KeyError(
+                    f"Missing dense profile for layer={layer_name!r} "
+                    f"on tp={tp_eff}."
+                )
+            return False
+        _select_scenario_table(
+            perf_db,
+            scenario_tables,
+            memory_scenario,
+            category=category,
+            layer_name=layer_name,
+        )
+        return True
     if category == "per_sequence":
-        return layer_name in tables.get("per_sequence", {})
+        scenario_tables = tables.get("per_sequence", {}).get(layer_name)
+        if scenario_tables is None:
+            if _is_profile_v2(perf_db):
+                raise KeyError(
+                    f"Missing per_sequence profile for layer={layer_name!r} "
+                    f"on tp={tp_eff}."
+                )
+            return False
+        _select_scenario_table(
+            perf_db,
+            scenario_tables,
+            memory_scenario,
+            category=category,
+            layer_name=layer_name,
+        )
+        return True
     if category == "attention":
-        return bool(tables.get("attention"))
+        scenario_tables = tables.get("attention")
+        if not scenario_tables:
+            if _is_profile_v2(perf_db):
+                raise KeyError(f"Missing attention profile on tp={tp_eff}.")
+            return False
+        _select_scenario_table(
+            perf_db,
+            scenario_tables,
+            memory_scenario,
+            category=category,
+        )
+        return True
     if category == "moe":
-        return bool(tables.get("moe"))
+        scenario_tables = tables.get("moe")
+        if not scenario_tables:
+            if _is_profile_v2(perf_db):
+                raise KeyError(f"Missing moe profile on tp={tp_eff}.")
+            return False
+        _select_scenario_table(
+            perf_db,
+            scenario_tables,
+            memory_scenario,
+            category=category,
+        )
+        return True
     return False
 
 
@@ -1211,6 +1499,13 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
             continue
         if not _layer_available(ctx.perf_db, ctx.tp_size, layer_name):
             key = (ctx.perf_db["variant"], ctx.perf_db["model"], layer_name)
+            if ctx.perf_db.get("memory_profile_id") is not None:
+                key = (
+                    ctx.perf_db["variant"],
+                    ctx.perf_db["model"],
+                    ctx.perf_db["memory_profile_id"],
+                    layer_name,
+                )
             if key not in _skipped_layer_warned:
                 _skipped_layer_warned.add(key)
                 logger.warning(
