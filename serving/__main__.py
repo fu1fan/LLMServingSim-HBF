@@ -39,8 +39,6 @@ from serving.core.memory_tiering_config import (
 from serving.core.hbf_memory_config import install_hbf_memory_resources
 import sys as flush
 
-from pyinstrument import Profiler
-
 
 def _pad_batch_to_max(batch, max_len):
     """Pad a batch up to ``max_len`` for DP-sync.

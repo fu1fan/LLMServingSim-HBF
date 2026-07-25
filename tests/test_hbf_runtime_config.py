@@ -1,15 +1,9 @@
 import unittest
-import sys
-import types
 import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-
-pyinstrument = types.ModuleType("pyinstrument")
-pyinstrument.Profiler = object
-sys.modules.setdefault("pyinstrument", pyinstrument)
 
 import serving.__main__ as serving_main
 

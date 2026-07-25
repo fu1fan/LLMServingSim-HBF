@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from time import time
 from .request import *
 from .logger import get_logger
@@ -28,7 +29,7 @@ def generate_graph(batch, hardware, num_npus, node_id=0, instance_id=0, npu_offs
     os.makedirs(workload_dir, exist_ok=True)
 
     cmd = [
-        'python', '-m', 'chakra.src.converter.converter', 'LLM',
+        sys.executable, '-m', 'chakra.src.converter.converter', 'LLM',
         '--input', trace_path,
         '--output', output_path,
         '--num-npus', str(num_npus),
