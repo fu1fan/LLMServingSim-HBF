@@ -2,6 +2,7 @@ import csv
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -661,6 +662,27 @@ class ProfileV2ContractTest(unittest.TestCase):
                 "cli-a",
             ),
             ("gpu", "model", "bf16", "cli-a"),
+        )
+        external_root = os.path.abspath("/external/perf")
+        self.assertEqual(
+            trace_generator._profile_root(
+                "gpu",
+                "org/model",
+                "bf16",
+                "cli-a",
+                profile_root=external_root,
+            ),
+            f"{external_root}/gpu/org/model/bf16/cli-a",
+        )
+        self.assertEqual(
+            trace_generator._perf_db_cache_key(
+                "gpu",
+                "model",
+                "bf16",
+                "cli-a",
+                profile_root=external_root,
+            ),
+            (external_root, "gpu", "model", "bf16", "cli-a"),
         )
 
     def test_partial_is_statically_valid_but_runtime_rejects_it(self):

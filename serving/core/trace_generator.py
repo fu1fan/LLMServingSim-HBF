@@ -100,13 +100,29 @@ def _arch_yaml_path(model_type):
     return candidate_paths[0]
 
 
-def _variant_root(hardware, model, variant):
-    return f"{_PROFILER_ROOT_REL}/perf/{hardware}/{model}/{variant}"
+def _variant_root(hardware, model, variant, profile_root=None):
+    if profile_root is None:
+        profile_root = os.path.join(_PROFILER_ROOT_REL, "perf")
+    else:
+        profile_root = os.path.abspath(os.fspath(profile_root))
+    return os.path.join(profile_root, hardware, model, variant)
 
 
-def _profile_root(hardware, model, variant, memory_profile_id=None):
+def _profile_root(
+    hardware,
+    model,
+    variant,
+    memory_profile_id=None,
+    *,
+    profile_root=None,
+):
     """保持 v1 路径不变；v2 在 variant 下增加稳定身份目录。"""
-    root = _variant_root(hardware, model, variant)
+    root = _variant_root(
+        hardware,
+        model,
+        variant,
+        profile_root=profile_root,
+    )
     if memory_profile_id is None:
         return root
     profile_id = validate_memory_profile_id(
@@ -116,15 +132,25 @@ def _profile_root(hardware, model, variant, memory_profile_id=None):
     return os.path.join(root, profile_id)
 
 
-def _perf_db_cache_key(hardware, model, variant, memory_profile_id=None):
-    """v1 沿用三元键，v2 用第四维隔离不同硬件内存配置。"""
+def _perf_db_cache_key(
+    hardware,
+    model,
+    variant,
+    memory_profile_id=None,
+    *,
+    profile_root=None,
+):
+    """默认目录保持旧键；外部目录加入绝对路径避免跨根复用。"""
+    prefix = ()
+    if profile_root is not None:
+        prefix = (os.path.abspath(os.fspath(profile_root)),)
     if memory_profile_id is None:
-        return (hardware, model, variant)
+        return prefix + (hardware, model, variant)
     profile_id = validate_memory_profile_id(
         memory_profile_id,
         field="memory_profile_id",
     )
-    return (hardware, model, variant, profile_id)
+    return prefix + (hardware, model, variant, profile_id)
 
 
 # ======================================================================
@@ -701,7 +727,8 @@ def _validate_v2_runtime_limits(
 def _load_perf_db(hardware, model, variant, tp_needed, model_type,
                   memory_profile_id=None, model_config=None,
                   runtime_max_num_batched_tokens=None,
-                  runtime_max_num_seqs=None, runtime_block_size=None):
+                  runtime_max_num_seqs=None, runtime_block_size=None,
+                  profile_root=None):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
@@ -711,6 +738,7 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
         model,
         variant,
         memory_profile_id,
+        profile_root=profile_root,
     )
     if cache_key in _perf_db_cache:
         db = _perf_db_cache[cache_key]
@@ -726,7 +754,13 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type,
             )
         return db
 
-    root = _profile_root(hardware, model, variant, memory_profile_id)
+    root = _profile_root(
+        hardware,
+        model,
+        variant,
+        memory_profile_id,
+        profile_root=profile_root,
+    )
     if not os.path.isdir(root):
         if memory_profile_id is None:
             raise FileNotFoundError(
@@ -1710,7 +1744,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      runtime_block_size=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                     memory_scenario_policy=None, memory_view=None):
+                     memory_scenario_policy=None, memory_view=None,
+                     profile_root=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -1730,6 +1765,11 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         )
 
     tp_needed = {max(int(tp_size), 1)}
+    profile_kwargs = (
+        {}
+        if profile_root is None
+        else {"profile_root": profile_root}
+    )
     if memory_scenario_policy.is_v2:
         perf_db = _load_perf_db(
             hardware,
@@ -1742,6 +1782,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
             runtime_max_num_seqs=runtime_max_num_seqs,
             runtime_block_size=runtime_block_size,
+            **profile_kwargs,
         )
     else:
         perf_db = _load_perf_db(
@@ -1750,6 +1791,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             variant,
             tp_needed,
             model_type,
+            **profile_kwargs,
         )
     _validate_policy_against_profile(memory_scenario_policy, perf_db)
     scenario_resolver = None
@@ -2460,7 +2502,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       runtime_block_size=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                      memory_scenario_policy=None, memory_view=None):
+                      memory_scenario_policy=None, memory_view=None,
+                      profile_root=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2469,7 +2512,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            runtime_block_size=runtime_block_size,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
                            memory_scenario_policy=memory_scenario_policy,
-                           memory_view=memory_view)
+                           memory_view=memory_view,
+                           profile_root=profile_root)
     block_mode_on = bool(
         block_mode_on
         or ctx.memory_scenario_policy.requires_per_block_trace
@@ -2522,7 +2566,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   runtime_block_size=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                                  memory_scenario_policy=None, memory_view=None):
+                                  memory_scenario_policy=None, memory_view=None,
+                                  profile_root=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2531,7 +2576,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            runtime_block_size=runtime_block_size,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
                            memory_scenario_policy=memory_scenario_policy,
-                           memory_view=memory_view)
+                           memory_view=memory_view,
+                           profile_root=profile_root)
     block_mode_on = bool(
         block_mode_on
         or ctx.memory_scenario_policy.requires_per_block_trace
@@ -2710,7 +2756,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
                    memory_scenario_policy=None, runtime_block_size=None,
-                   memory_view=None):
+                   memory_view=None, profile_root=None):
 
     model = batch.model
     config = get_config(model)
@@ -2777,7 +2823,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_block_size=runtime_block_size,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
                         memory_scenario_policy=memory_scenario_policy,
-                        memory_view=memory_view)
+                        memory_view=memory_view, profile_root=profile_root)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

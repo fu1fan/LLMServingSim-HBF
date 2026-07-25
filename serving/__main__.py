@@ -78,6 +78,16 @@ def _load_cluster_config_for_overrides(path):
     return load_cluster_config(path)
 
 
+def _resolve_profile_root(repo_root, path):
+    """Resolve the directory containing hardware Profile folders."""
+
+    if path is None:
+        path = os.path.join(repo_root, "profiler", "perf")
+    elif not os.path.isabs(path):
+        path = os.path.join(repo_root, path)
+    return os.path.abspath(path)
+
+
 def _resolve_output_file(path, run_id):
     if path is None:
         return None
@@ -348,6 +358,13 @@ def main():
     
     parser.add_argument('--cluster-config', type=str, default='configs/cluster/single_node_single_instance.json',
                         help='path to cluster config JSON defining node topology, instance layout, hardware, and memory hierarchy')
+    parser.add_argument(
+        '--profile-root',
+        type=str,
+        default=None,
+        help='root containing <hardware>/<model>/<variant> performance '
+             'Profile folders; defaults to profiler/perf under the repository',
+    )
     parser.add_argument('--max-num-seqs', type=int, default=128,
                         help='maximum number of sequences in a batch (0 = unlimited)')
     parser.add_argument('--max-num-batched-tokens', type=int, default=2048,
@@ -444,6 +461,7 @@ def main():
 
     args = parser.parse_args()
     
+    args.profile_root = _resolve_profile_root(cwd, args.profile_root)
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
@@ -518,9 +536,7 @@ def main():
         cluster["memory_config_path"],
         instances,
         instance_runtime_configs,
-        profiler_root=os.path.abspath(
-            os.path.join(astra_sim, "..", "profiler", "perf")
-        ),
+        profiler_root=args.profile_root,
         variant_resolver=resolve_variant,
     )
     if hbf_memory_spec is not None:
@@ -848,6 +864,7 @@ def main():
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        memory_scenario_policy=inst_cfg["memory_scenario_policy"],
                                        runtime_block_size=inst_cfg["block_size"],
+                                       profile_root=args.profile_root,
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -917,6 +934,7 @@ def main():
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            memory_scenario_policy=inst_cfg["memory_scenario_policy"],
                                            runtime_block_size=inst_cfg["block_size"],
+                                           profile_root=args.profile_root,
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -955,6 +973,7 @@ def main():
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    memory_scenario_policy=inst_cfg["memory_scenario_policy"],
                                    runtime_block_size=inst_cfg["block_size"],
+                                   profile_root=args.profile_root,
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

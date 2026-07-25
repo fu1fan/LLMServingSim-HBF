@@ -94,7 +94,7 @@ def _perf_db(*, version=2):
     }
 
 
-def _build_ctx(policy, perf_db):
+def _build_ctx(policy, perf_db, *, profile_root=None):
     with (
         mock.patch.object(
             trace_generator,
@@ -124,6 +124,7 @@ def _build_ctx(policy, perf_db):
             None,
             variant="bf16",
             memory_scenario_policy=policy,
+            profile_root=profile_root,
         )
     return ctx, loader
 
@@ -164,6 +165,19 @@ class MemoryScenarioRuntimeTest(unittest.TestCase):
             "bf16",
             {1},
             "toy",
+        )
+
+    def test_context_forwards_external_profile_root(self):
+        external_root = "/external/perf"
+        _, loader = _build_ctx(
+            _policy(),
+            _perf_db(),
+            profile_root=external_root,
+        )
+
+        self.assertEqual(
+            loader.call_args.kwargs["profile_root"],
+            external_root,
         )
 
     def test_context_rejects_unknown_scenario_and_layer_before_trace(self):

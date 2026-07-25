@@ -88,6 +88,24 @@ class HbfRuntimeConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, str(path)):
                 serving_main._load_cluster_config_for_overrides(str(path))
 
+    def test_profile_root_defaults_to_repo_and_resolves_relative(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+
+            self.assertEqual(
+                Path(serving_main._resolve_profile_root(str(repo_root), None)),
+                repo_root / "profiler" / "perf",
+            )
+            self.assertEqual(
+                Path(
+                    serving_main._resolve_profile_root(
+                        str(repo_root),
+                        "generated/perf",
+                    )
+                ),
+                repo_root / "generated" / "perf",
+            )
+
     def test_shutdown_checks_every_instance_memory(self):
         memories = [
             SimpleNamespace(
