@@ -63,6 +63,9 @@ def _instance(*, hbf=False):
 
 
 class HbfRuntimeConfigTest(unittest.TestCase):
+    def test_hbf_memory_validator_is_explicitly_imported(self):
+        self.assertTrue(callable(serving_main.validate_memory_config))
+
     def test_shutdown_checks_every_instance_memory(self):
         memories = [
             SimpleNamespace(

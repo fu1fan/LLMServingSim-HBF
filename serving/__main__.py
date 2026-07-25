@@ -23,6 +23,7 @@ from serving.core.graph_generator import *
 from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
+from serving.core.config_builder import validate_memory_config
 from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
@@ -522,7 +523,7 @@ def main():
         variant_resolver=resolve_variant,
     )
     if hbf_memory_spec is not None:
-        _validate_memory_config(
+        validate_memory_config(
             cluster["memory_config_path"],
             placement,
             enable_local_offloading=True,

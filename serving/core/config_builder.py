@@ -636,7 +636,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     _create_network_config(network_config_path, total_instances, link_bw, link_latency)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
-    _validate_memory_config(memory_config_path, placement, enable_local_offloading)
+    validate_memory_config(memory_config_path, placement, enable_local_offloading)
 
     cluster = {
         "num_nodes": num_nodes,
@@ -692,7 +692,7 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
     return
 
 # Validate memory configuration against placement settings
-def _validate_memory_config(memory_config_path, placement, enable_local_offloading):
+def validate_memory_config(memory_config_path, placement, enable_local_offloading):
 
     # 1) Load memory_config
     try:
@@ -750,6 +750,10 @@ def _validate_memory_config(memory_config_path, placement, enable_local_offloadi
             _check_entry(f"layer[{lname}]", ent or {})
     
     return
+
+
+# 兼容仍在调用旧私有入口的内部扩展，新代码应使用公开名称。
+_validate_memory_config = validate_memory_config
 
 def get_device(placement, block_idx, layer_name, kind):
     """
