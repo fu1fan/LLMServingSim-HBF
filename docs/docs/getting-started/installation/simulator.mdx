@@ -104,6 +104,20 @@ final per-request CSV at `outputs/example_single_run.csv`. If you
 see a `[FileNotFoundError: profile_*.csv]` or similar, check
 [Troubleshooting → Missing profile data](../troubleshooting#missing-profile-data).
 
+To run against an external LLMCompass export, point directly at its
+`perf` directory. The simulator uses the same root for startup
+validation and runtime lookup:
+
+```bash
+python -m serving \
+  --profile-root /absolute/path/to/llmcompass-export/perf \
+  --cluster-config /absolute/path/to/hbf-cluster.json \
+  --dataset workloads/example_trace.jsonl
+```
+
+No symlink under the repository's `profiler/perf` directory is
+required.
+
 
 
 ## You're done

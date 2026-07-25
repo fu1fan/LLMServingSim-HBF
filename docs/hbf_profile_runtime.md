@@ -37,7 +37,7 @@ Profile，以避免 demand 访存或 collective 被重复计费。
 
 ## 2. Profile v2 输入契约
 
-实例按下面的路径查找 Profile：
+默认情况下，实例按下面的路径查找 Profile：
 
 ```text
 profiler/perf/<hardware>/<model_name>/<variant>/<memory_profile_id>/
@@ -52,6 +52,20 @@ profiler/perf/<hardware>/<model_name>/<variant>/<memory_profile_id>/
 `variant` 由 `dtype` 和 `kv_cache_dtype` 推导。例如
 `bfloat16 + auto` 对应 `bf16`。不要手工改名 LLMCompass 生成的
 `memory_profile_id`，运行就绪 ID 与 performance identity 摘要绑定。
+
+若 LLMCompass 将 bundle 导出到仓库外，可通过 `--profile-root` 直接指定
+包含 `<hardware>/<model_name>/<variant>` 的 `perf` 根目录：
+
+```bash
+python -m serving \
+  --profile-root /absolute/path/to/llmcompass-export/perf \
+  --cluster-config /absolute/path/to/hbf-cluster.json \
+  ...
+```
+
+相对 `--profile-root` 以 LLMServingSim 仓库根目录为基准。该参数同时用于
+HBF manifest 校验和 Trace 性能查询，不需要再向仓库的 `profiler/perf`
+创建软链接。
 
 HBF 实例要求 manifest 至少满足：
 
@@ -281,6 +295,7 @@ transformer 层数不能整除 PP，当前 RadixCache 的标量容量接口无�
 ```bash
 python -m serving \
   --cluster-config configs/cluster/hbf_profile_example.json \
+  --profile-root /absolute/path/to/llmcompass-export/perf \
   --dataset workloads/examples/replace-with-workload.jsonl \
   --memory-tiering-stats-output results/{run_id}-hbf.json \
   --network-backend analytical
@@ -295,6 +310,9 @@ python -m serving \
 - 策略动作计数与 batch 驻留命中；
 - Attention 查询中观察到的 HBM/HBF 驻留组。
 
+每个实际形成的新 batch 只记录一次驻留命中或未命中；同一 batch 在其他
+NPU 上重放不会重复计数，因此始终满足 `hits + misses == observed`。
+
 该统计只接收 Serving 完成的显式迁移和驻留事件，不含 Profile 已计入
 `time_us` 的 HBM/HBF demand 四向字节。需要审计算子 demand 流量时，应
 查看 Profile CSV 的四个 audit 列，不能把两类字节相加后称为迁移量。
@@ -308,3 +326,6 @@ python -m serving \
 5. Trace 中仅有显式迁移产生 HBM/HBF memory 节点；
 6. 用相同 workload 分别运行全 HBM、静态 HBF 权重、HBF KV 阈值等
    对照组，不把 HBF 参数化预测描述成真实硬件测量。
+
+路径和统计修复只提高运行可复现性与结果可审计性，不会把
+`performance_basis.hbf: parameterized_projection` 提升为真实硬件测量。

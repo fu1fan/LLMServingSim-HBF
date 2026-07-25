@@ -49,6 +49,21 @@ profiler/perf/<HARDWARE>/<MODEL>/<variant>/<memory_profile_id>/
     └── attention.csv
 ```
 
+The simulator normally reads this tree from `profiler/perf`. To use
+an LLMCompass export elsewhere, pass the directory that directly
+contains the hardware folders:
+
+```bash
+python -m serving \
+  --profile-root /absolute/path/to/llmcompass-export/perf \
+  --cluster-config /absolute/path/to/hbf-cluster.json \
+  ...
+```
+
+Relative profile roots are resolved from the LLMServingSim repository
+root. The same resolved directory is used for manifest validation and
+runtime latency lookup, so no symlink under `profiler/perf` is needed.
+
 Each v2 CSV adds a discrete `memory_scenario` key and four physical
 traffic audit columns:
 
@@ -74,6 +89,10 @@ producer claims are present and internally consistent:
 - complete architecture, TP, scenario, engine, and attention-grid
   requirements;
 - a canonical SHA-256 performance identity.
+
+Passing these runtime checks does not turn projected HBF timings into
+measurements. `performance_basis.hbf: parameterized_projection` remains
+the required label until matching HBF hardware measurements exist.
 
 New LLMCompass bundles also include `access_catalog`. It maps each
 stable `operator_id/access_id` to `semantic`, `access_type`, and

@@ -5,12 +5,25 @@ title: Validating your changes
 
 # Validating your changes
 
-The project does not (yet) ship a unit-test suite. Validation is
-done by running the simulator against known scenarios and comparing
-results. This page covers the three checks you should run before
-opening a PR, in increasing order of cost.
+Validation combines the Python unit-test suite with simulator runs
+against known scenarios. Run the checks below before opening a PR,
+in increasing order of cost.
 
-## 1. Smoke run (every PR, ~30 seconds)
+## 1. Unit tests (every PR)
+
+Run the complete suite from the repository root:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+For HBF runtime, Profile v2, or memory-tiering changes, the relevant
+files are `test_hbf_*.py`, `test_memory_tiering*.py`,
+`test_profile_v2_*.py`, and `test_residency_*.py`. These tests create
+their Profile fixtures in temporary directories; generated Profile
+CSVs, traces, and ASTRA inputs must not be committed.
+
+## 2. Smoke run (every PR, ~30 seconds)
 
 The minimum bar: run the smallest bundled scenario and confirm it
 still finishes without errors.
@@ -33,7 +46,7 @@ What to check:
 If your change is in `serving/`, this is the floor. Don't push a
 commit that breaks the smoke run.
 
-## 2. Targeted scenarios (when the change touches related features)
+## 3. Targeted scenarios (when the change touches related features)
 
 Map your edit to the scenario(s) that exercise it. The bundled
 cluster configs cover the major features:
@@ -56,7 +69,12 @@ cluster configs cover the major features:
 Pick the relevant ones and confirm they still produce sensible
 output.
 
-## 3. Bench validation (changes that affect end-to-end accuracy)
+For an HBF Profile exported outside this repository, include
+`--profile-root /absolute/path/to/export/perf` in the smoke command.
+Do not create a temporary symlink under the checked-in
+`profiler/perf` tree.
+
+## 4. Bench validation (changes that affect end-to-end accuracy)
 
 If your change could move the simulator's output relative to real
 vLLM (anything in `scheduler.py`, `trace_generator.py`,
@@ -89,7 +107,7 @@ truth than the old").
 For deeper detail on the validation methodology, see
 [`bench/README.md`](https://github.com/casys-kaist/LLMServingSim/blob/main/bench/README.md).
 
-## 4. Profiler-side changes (if you touched `profiler/`)
+## 5. Profiler-side changes (if you touched `profiler/`)
 
 Profiler changes don't show up in the simulator until you regenerate
 the perf bundle. Run a small profile to confirm your edit doesn't
@@ -102,7 +120,7 @@ MODEL=meta-llama/Llama-3.1-8B HARDWARE=RTXPRO6000 \
 ```
 
 Then verify the simulator still loads it cleanly with the smoke
-run from step 1.
+run from step 2.
 
 If you only changed the alpha fit (`fit_alpha.py`), you can use
 `SKIP_DENSE=1 SKIP_PER_SEQUENCE=1 SKIP_ATTENTION=1 SKIP_MOE=1
