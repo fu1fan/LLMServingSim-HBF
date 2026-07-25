@@ -601,9 +601,6 @@ class MemoryModel():
                 else:
                     action = "migrate"
                 self.tiering_stats.record_policy_action(action)
-            self.tiering_stats.record_residency_batch(
-                hit=not bool(plan.transfers)
-            )
             self._observe_tiering_usage()
         return plan.transfers
 
@@ -650,6 +647,15 @@ class MemoryModel():
         events = tuple(self._kv_transfer_events)
         self._kv_transfer_events.clear()
         return events
+
+    def record_scheduled_residency_batch(self, transfers):
+        """每个实际形成的 batch 只记录一次驻留命中。"""
+
+        if self.tiering_stats is None:
+            return
+        self.tiering_stats.record_residency_batch(
+            hit=not bool(transfers)
+        )
 
     def complete_kv_transfer_events(self, events):
         """在 ASTRA batch 完成后提交迁移统计。"""

@@ -441,6 +441,9 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
         )
         self.assertEqual(batch.memory_transfers, ())
         self.assertGreater(scheduler.memory.npu_used, 0)
+        snapshot = scheduler.memory.tiering_stats_snapshot()
+        self.assertEqual(snapshot.residency_batches, 1)
+        self.assertEqual(snapshot.residency_hit_batches, 1)
 
         _, _, finished = scheduler.add_done(
             batch.batch_id + 1,
@@ -452,6 +455,24 @@ class HbfSchedulerMemoryTest(unittest.TestCase):
             scheduler.memory.npu_used,
             scheduler.memory.hbm_weight,
         )
+
+    def test_prefix_scheduler_records_weights_hbf_residency_batch(self):
+        scheduler = _scheduler(
+            _tiering(
+                weights={"policy": "hbf_only"},
+                kv={"policy": "hbm_only"},
+            ),
+            prefix=True,
+        )
+        scheduler.add_request([2, "test-model", 16, 17, 0, 0])
+
+        batch = scheduler.schedule(0, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.memory_transfers, ())
+        snapshot = scheduler.memory.tiering_stats_snapshot()
+        self.assertEqual(snapshot.residency_batches, 1)
+        self.assertEqual(snapshot.residency_hit_batches, 1)
 
     def test_pd_decode_admission_uses_target_kv_tier(self):
         config = _tiering(kv={"policy": "hbf_only"})

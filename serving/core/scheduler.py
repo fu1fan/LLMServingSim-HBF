@@ -420,6 +420,9 @@ class Scheduler:
             if self.memory.tiering_enabled:
                 batch.memory_view = self.memory.batch_memory_view(batch_req)
                 batch.memory_transfers = self.memory.take_kv_transfer_events()
+                self.memory.record_scheduled_residency_batch(
+                    batch.memory_transfers
+                )
             return batch
         
         # Schedule already batched request
@@ -754,6 +757,9 @@ class Scheduler:
             if self.memory.tiering_enabled:
                 batch.memory_view = self.memory.batch_memory_view(batch_req)
                 batch.memory_transfers = self.memory.take_kv_transfer_events()
+                self.memory.record_scheduled_residency_batch(
+                    batch.memory_transfers
+                )
             # batch.log()
             return batch
         # Schedule already batched request
