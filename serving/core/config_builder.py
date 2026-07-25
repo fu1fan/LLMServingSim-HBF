@@ -25,6 +25,32 @@ _COLLECTIVE_IMPL_KEYS = [
 ]
 
 
+def resolve_cluster_config_path(astra_sim, cluster_config_path):
+    """Resolve cluster configs relative to the LLMServingSim repository."""
+
+    if os.path.isabs(cluster_config_path):
+        return os.path.normpath(cluster_config_path)
+    return os.path.abspath(
+        os.path.join(astra_sim, os.pardir, cluster_config_path)
+    )
+
+
+def load_cluster_config(cluster_config_path):
+    """Load one resolved cluster configuration path."""
+
+    try:
+        with open(cluster_config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Cluster configuration file '{cluster_config_path}' not found."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Failed to parse JSON from '{cluster_config_path}': {exc}"
+        ) from exc
+
+
 def _prepare_input_config_paths(astra_sim, inputs_root):
     if inputs_root is None:
         inputs_root = os.path.join(astra_sim, "inputs")
@@ -271,17 +297,11 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 # parse cluster configuration from JSON file and build config file for astra-sim
 def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
-    cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
-    
-    try:
-        with open(cluster_config_path, 'r') as f:
-            cluster_config = json.load(f)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Cluster configuration file '{cluster_config_path}' not found.")
-
-    except json.JSONDecodeError:
-        print(f"Failed to parse JSON from '{cluster_config_path}'.")
-        exit(1)
+    cluster_config_path = resolve_cluster_config_path(
+        astra_sim,
+        cluster_config_path,
+    )
+    cluster_config = load_cluster_config(cluster_config_path)
 
     inputs_root, network_config_path, system_config_path, memory_config_path = (
         _prepare_input_config_paths(astra_sim, inputs_root)

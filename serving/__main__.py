@@ -76,15 +76,8 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
-def _cluster_config_path(path):
-    if os.path.isabs(path):
-        return path
-    return os.path.join("..", path)
-
-
 def _load_cluster_config_for_overrides(path):
-    with open(_cluster_config_path(path), "r") as f:
-        return json.load(f)
+    return load_cluster_config(path)
 
 
 def _resolve_output_file(path, run_id):
@@ -480,7 +473,13 @@ def main():
     num_req=args.num_reqs
     log_interval=args.log_interval
     network_backend = args.network_backend
-    raw_cluster_config = _load_cluster_config_for_overrides(args.cluster_config)
+    cluster_config_path = resolve_cluster_config_path(
+        astra_sim,
+        args.cluster_config,
+    )
+    raw_cluster_config = _load_cluster_config_for_overrides(
+        cluster_config_path
+    )
     raw_instances = list(_iter_raw_instances(raw_cluster_config))
     build_enable_local_offloading = args.enable_local_offloading or any(
         inst.get("enable_local_offloading", False) for inst in raw_instances)
@@ -488,8 +487,12 @@ def main():
         inst.get("enable_attn_offloading", False) for inst in raw_instances)
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(
-        astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
-        inputs_root=run_paths.inputs_root)
+        astra_sim,
+        cluster_config_path,
+        build_enable_local_offloading,
+        build_enable_attn_offloading,
+        inputs_root=run_paths.inputs_root,
+    )
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]

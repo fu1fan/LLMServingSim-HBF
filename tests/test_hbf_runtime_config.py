@@ -66,6 +66,34 @@ class HbfRuntimeConfigTest(unittest.TestCase):
     def test_hbf_memory_validator_is_explicitly_imported(self):
         self.assertTrue(callable(serving_main.validate_memory_config))
 
+    def test_cluster_config_path_preserves_absolute_and_resolves_relative(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            astra_sim = root / "astra-sim"
+            relative = serving_main.resolve_cluster_config_path(
+                str(astra_sim),
+                "configs/cluster.json",
+            )
+            absolute_input = root / "external" / "cluster.json"
+            absolute = serving_main.resolve_cluster_config_path(
+                str(astra_sim),
+                str(absolute_input),
+            )
+
+            self.assertEqual(
+                Path(relative),
+                root / "configs" / "cluster.json",
+            )
+            self.assertEqual(Path(absolute), absolute_input)
+
+    def test_cluster_config_json_error_reports_resolved_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "invalid.json"
+            path.write_text("{", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, str(path)):
+                serving_main._load_cluster_config_for_overrides(str(path))
+
     def test_shutdown_checks_every_instance_memory(self):
         memories = [
             SimpleNamespace(
