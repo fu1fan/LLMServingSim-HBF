@@ -278,6 +278,65 @@ class ProfileV2LookupTest(unittest.TestCase):
     def tearDown(self):
         trace_generator._perf_db_cache.clear()
 
+    def test_external_profile_roots_are_loaded_and_cached_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = [
+                Path(tmp) / "first" / "perf",
+                Path(tmp) / "second" / "perf",
+            ]
+            for root, time_us in zip(roots, (10, 40)):
+                rows = {
+                    filename: [
+                        _row(filename, scenario, time_us)
+                        for scenario in ("all_hbm", "input_hbf")
+                    ]
+                    for filename in TABLE_SHAPES
+                }
+                bundle = (
+                    root
+                    / "gpu"
+                    / "org"
+                    / "model"
+                    / "bf16"
+                    / _runtime_profile_id("cli-a")
+                )
+                _write_bundle(bundle, "cli-a", rows)
+
+            loaded = []
+            with mock.patch.object(
+                trace_generator,
+                "_load_architecture",
+                return_value=TOY_ARCHITECTURE,
+            ):
+                for root in roots:
+                    loaded.append(
+                        trace_generator._load_perf_db(
+                            "gpu",
+                            "org/model",
+                            "bf16",
+                            {1},
+                            "toy",
+                            memory_profile_id=_runtime_profile_id("cli-a"),
+                            model_config={"num_experts": 4},
+                            profile_root=str(root),
+                        )
+                    )
+
+        self.assertEqual(
+            [
+                trace_generator._lookup_dense(
+                    perf_db,
+                    "qkv_proj",
+                    1,
+                    128,
+                    memory_scenario="all_hbm",
+                )
+                for perf_db in loaded
+            ],
+            [10000, 40000],
+        )
+        self.assertEqual(len(trace_generator._perf_db_cache), 2)
+
     def test_same_shape_scenarios_are_isolated_in_all_four_categories(self):
         rows = {
             filename: [

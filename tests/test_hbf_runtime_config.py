@@ -106,6 +106,25 @@ class HbfRuntimeConfigTest(unittest.TestCase):
                 repo_root / "generated" / "perf",
             )
 
+    def test_build_cluster_config_accepts_absolute_path(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        astra_sim = repo_root / "astra-sim"
+        cluster_path = (
+            repo_root
+            / "configs"
+            / "cluster"
+            / "single_node_single_instance.json"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            cluster = serving_main.build_cluster_config(
+                str(astra_sim),
+                str(cluster_path),
+                inputs_root=str(Path(td) / "inputs"),
+            )
+
+        self.assertEqual(cluster["num_nodes"], 1)
+        self.assertEqual(cluster["num_instances"], 1)
+
     def test_shutdown_checks_every_instance_memory(self):
         memories = [
             SimpleNamespace(

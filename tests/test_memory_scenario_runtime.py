@@ -1,13 +1,11 @@
-import importlib
 import inspect
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import serving.__main__ as serving_main
 from serving.core import trace_generator
 from serving.core.memory_scenario import (
     MemoryScenarioCompatibilityError,
@@ -127,15 +125,6 @@ def _build_ctx(policy, perf_db, *, profile_root=None):
             profile_root=profile_root,
         )
     return ctx, loader
-
-
-def _import_serving_main():
-    # pyinstrument 只用于 CLI 性能分析，测试配置解析时无需安装。
-    if "pyinstrument" not in sys.modules:
-        module = types.ModuleType("pyinstrument")
-        module.Profiler = object
-        sys.modules["pyinstrument"] = module
-    return importlib.import_module("serving.__main__")
 
 
 class MemoryScenarioRuntimeTest(unittest.TestCase):
@@ -423,7 +412,6 @@ class MemoryScenarioRuntimeTest(unittest.TestCase):
         )
 
     def test_main_runtime_gate_uses_final_flags_and_all_trace_calls_propagate(self):
-        serving_main = _import_serving_main()
         args = SimpleNamespace(
             dtype="bfloat16",
             kv_cache_dtype="auto",
