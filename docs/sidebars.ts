@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
             'examples/memory-tiers/prefix-caching',
             'examples/memory-tiers/cxl-memory',
             'examples/memory-tiers/fp8-kv-cache',
+            'examples/memory-tiers/hbf-static-weights',
           ],
         },
         {

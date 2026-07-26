@@ -63,6 +63,7 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `model_name` | String | Yes | HuggingFace model identifier (must match `configs/model/`) |
 | `hardware` | String | Yes | Hardware name matching `profiler/perf_models/{hardware}/` |
 | `npu_mem` | Object | Yes | NPU memory config (`mem_size` in GB, `mem_bw` in GB/s, `mem_latency` in ns) |
+| `hbf_mem` | Object | No | Per-GPU aggregate HBF capacity and mutually exclusive `scale` or `profile` performance source |
 | `pd_type` | String/null | Yes | `"prefill"`, `"decode"`, or `null` for combined |
 | `num_npus` | Integer | * | Total GPUs for this instance (inferred from `tp_size * pp_size` if omitted) |
 | `tp_size` | Integer | * | Tensor parallel degree (inferred from `num_npus // pp_size` if omitted) |
@@ -150,6 +151,38 @@ weights are sharded by `ep_size` (each instance holds `num_local_experts // ep_s
 | `cxl_mem` | top-level | Object | CXL memory expansion parameters (`mem_size`, `mem_bw`, `mem_latency`, `num_devices`) |
 | `pim_config` | node cpu_mem | String | Name of a PIM device config in `configs/pim/` |
 
+### Static-weight HBF
+
+Schema version 1 supports static weights only:
+
+```json
+{
+  "hbf_mem": {
+    "schema_version": 1,
+    "num_stacks": 8,
+    "stack_capacity_gb": 512,
+    "performance": {
+      "source": "scale",
+      "latency_scale": 1.0
+    }
+  },
+  "placement": {
+    "default": {
+      "weights": "hbf",
+      "kv_loc": "npu",
+      "kv_evict_loc": "cpu"
+    }
+  }
+}
+```
+
+Capacity is derived in binary GB (`2^30` bytes). `hbf` is accepted for
+`placement.default`, block rules, and layer rules. It is rejected for
+KV placement and eviction until HBF KV offload is implemented. See
+the documentation page
+`docs/docs/examples/memory-tiers/hbf-static-weights.md` for performance
+sources, Profile Bundle provenance, and sweep outputs.
+
 ## Provided configurations
 
 | File | Description |
@@ -168,3 +201,7 @@ weights are sharded by `ep_size` (each instance holds `num_local_experts // ep_s
 | `single_node_power_instance.json` | Single node with power modeling enabled |
 | `dual_node_multi_instance.json` | Two nodes, two instances each |
 | `dual_node_moe_dp_ep_intra_inter_instance.json` | Two-node MoE DP+EP example with per-dimension intra/inter link settings |
+| `hbf_b200_llama405b_tp8.json` | B200-style HBF template for Llama 3.1 405B, TP8 |
+| `hbf_rtxpro6000_llama405b_tp8.json` | RTX PRO 6000 HBF template for Llama 3.1 405B, TP8 |
+| `hbf_b200_qwen3_235b_tp4_ep4.json` | B200-style HBF template for Qwen3-235B-A22B, TP4/EP4 |
+| `hbf_rtxpro6000_qwen3_235b_tp4_ep4.json` | RTX PRO 6000 HBF template for Qwen3-235B-A22B, TP4/EP4 |

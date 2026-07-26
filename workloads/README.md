@@ -98,6 +98,13 @@ executions.
 | File | Description |
 | --- | --- |
 | `example_trace.jsonl` | Small example trace for quick testing |
+| `hbf-saturated-1024-128-300.jsonl` | 300 fixed 1024-input/128-output requests, all arriving at t=0 |
+| `hbf-saturated-2048-512-300.jsonl` | 300 fixed 2048-input/512-output requests, all arriving at t=0 |
+| `hbf-saturated-2048-2048-300.jsonl` | 300 fixed 2048-input/2048-output requests, all arriving at t=0 |
+
+The HBF saturated workloads intentionally omit token IDs because they
+measure fixed-shape capacity and throughput rather than prefix reuse.
+Run them with `--no-enable-prefix-caching`.
 
 ## Generating workloads
 

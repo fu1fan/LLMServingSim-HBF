@@ -65,6 +65,17 @@ matching runtime knobs per `instances[i]`; see
 | `--dataset` | path | `None` | JSONL workload file. See **[Workloads → JSONL format](/docs/workloads/jsonl-format)** |
 | `--num-reqs` | int | `0` | Entries to load from the dataset (`0` = all). For agentic, each entry is a session |
 | `--output` | path | `None` | Per-request CSV output path. Stdout only if `None`. The literal `{run_id}` is replaced with the active run id |
+| `--hbf-summary-output` | path | `None` | HBF capacity, timing-source, evidence, and energy-caveat JSON. Supports `{run_id}` |
+
+## HBF sensitivity analysis
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--hbf-latency-scale` | positive float | config value | Override every scale-based HBF instance for this process. Rejected for external-profile sources |
+
+For multi-point scans, use `python scripts/hbf_sweep.py` so every
+coefficient runs in a fresh simulator process. See
+**[HBF static-weight backend](/docs/examples/memory-tiers/hbf-static-weights)**.
 
 ## Run isolation
 
@@ -100,6 +111,7 @@ removed after a successful simulation by default.
 | PIM attention offload | `--enable-attn-offloading` (cluster config sets `pim_config`) |
 | FP8 KV cache | `--kv-cache-dtype fp8` |
 | ns3 backend | `--network-backend ns3` |
+| HBF weight sensitivity | cluster `hbf_mem` + `python scripts/hbf_sweep.py` |
 
 For the full conceptual treatment of each feature, browse the
 **[Simulator](/docs/simulator/architecture)** section. For runnable
