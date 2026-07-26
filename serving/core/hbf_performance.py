@@ -1,5 +1,6 @@
 """Operator-latency sources for weights resident in HBF."""
 
+import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -11,7 +12,12 @@ from .hbf_model import is_hbf_location
 def apply_hbf_latency_scale_override(instances, latency_scale):
     if latency_scale is None:
         return
-    if latency_scale <= 0:
+    if (
+        not isinstance(latency_scale, (int, float))
+        or isinstance(latency_scale, bool)
+        or not math.isfinite(latency_scale)
+        or latency_scale <= 0
+    ):
         raise ValueError("--hbf-latency-scale must be positive")
 
     hbf_instances = [
@@ -100,6 +106,7 @@ class ScaleHBFPerformanceSource(HBFPerformanceSource):
         if (
             not isinstance(latency_scale, (int, float))
             or isinstance(latency_scale, bool)
+            or not math.isfinite(latency_scale)
             or latency_scale <= 0
         ):
             raise ValueError("HBF latency_scale must be a positive number")

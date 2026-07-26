@@ -1,5 +1,6 @@
 """Configuration and capacity accounting for HBF attached to one GPU."""
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -56,7 +57,11 @@ def parse_hbf_config(value):
         )
 
     schema_version = value["schema_version"]
-    if schema_version != 1:
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
         raise ValueError(
             f"Unsupported hbf_mem schema_version {schema_version!r}; expected 1"
         )
@@ -81,6 +86,7 @@ def parse_hbf_config(value):
         if (
             not isinstance(latency_scale, (int, float))
             or isinstance(latency_scale, bool)
+            or not math.isfinite(latency_scale)
             or latency_scale <= 0
         ):
             raise ValueError(
@@ -131,11 +137,16 @@ class HBFMemory:
     )
 
     def __post_init__(self):
-        if not isinstance(self.num_stacks, int) or self.num_stacks <= 0:
+        if (
+            not isinstance(self.num_stacks, int)
+            or isinstance(self.num_stacks, bool)
+            or self.num_stacks <= 0
+        ):
             raise ValueError("HBF num_stacks must be a positive integer")
         if (
             not isinstance(self.stack_capacity_gb, (int, float))
             or isinstance(self.stack_capacity_gb, bool)
+            or not math.isfinite(self.stack_capacity_gb)
             or self.stack_capacity_gb <= 0
         ):
             raise ValueError(

@@ -82,7 +82,14 @@ class ScaleHBFPerformanceTest(unittest.TestCase):
         )
 
     def test_invalid_scale_is_rejected(self):
-        for value in (0, -1, True, "2"):
+        for value in (
+            0,
+            -1,
+            True,
+            "2",
+            float("nan"),
+            float("inf"),
+        ):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     ScaleHBFPerformanceSource(value)

@@ -48,7 +48,14 @@ class HBFMemoryTest(unittest.TestCase):
             memory.free(11, "kv")
 
     def test_invalid_stack_configuration_is_rejected(self):
-        for stacks, capacity in ((0, 1), (1, 0), (1.5, 1)):
+        for stacks, capacity in (
+            (0, 1),
+            (1, 0),
+            (1.5, 1),
+            (True, 1),
+            (1, float("nan")),
+            (1, float("inf")),
+        ):
             with self.subTest(stacks=stacks, capacity=capacity):
                 with self.assertRaises(ValueError):
                     HBFMemory(stacks, capacity)
@@ -106,9 +113,19 @@ class HBFConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schema_version"):
             parse_hbf_config(value)
 
+        value["schema_version"] = True
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            parse_hbf_config(value)
+
         value["schema_version"] = 1
         with self.assertRaisesRegex(ValueError, "latency_scale"):
             parse_hbf_config(value)
+
+        for invalid in (float("nan"), float("inf")):
+            value["performance"]["latency_scale"] = invalid
+            with self.subTest(latency_scale=invalid):
+                with self.assertRaisesRegex(ValueError, "latency_scale"):
+                    parse_hbf_config(value)
 
 
 class HBFPlacementTest(unittest.TestCase):
