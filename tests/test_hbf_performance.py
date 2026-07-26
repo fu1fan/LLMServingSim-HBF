@@ -1,8 +1,14 @@
 import unittest
+import csv
+import tempfile
+from pathlib import Path
+
+import yaml
 
 from serving.core.hbf_performance import (
     HBFOperatorQuery,
     IdentityHBFPerformanceSource,
+    ProfileBundleHBFPerformanceSource,
     ScaleHBFPerformanceSource,
 )
 
@@ -80,6 +86,95 @@ class ScaleHBFPerformanceTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     ScaleHBFPerformanceSource(value)
+
+
+class ProfileBundleHBFPerformanceTest(unittest.TestCase):
+    def _bundle(self, root, *, producer="MacSim", include_layer=True):
+        variant_root = (
+            Path(root)
+            / "B200_HBF"
+            / "meta-llama"
+            / "Llama-3.1-8B"
+            / "bf16"
+        )
+        tp_dir = variant_root / "tp1"
+        tp_dir.mkdir(parents=True)
+        meta = {
+            "hardware": "B200_HBF",
+            "model": "meta-llama/Llama-3.1-8B",
+            "variant": "bf16",
+            "hbf_profile": {
+                "schema_version": 1,
+                "producer": producer,
+                "source": "cycle-level-simulation",
+            },
+        }
+        (variant_root / "meta.yaml").write_text(
+            yaml.safe_dump(meta),
+            encoding="utf-8",
+        )
+        with (tp_dir / "dense.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["layer", "tokens", "time_us"],
+            )
+            writer.writeheader()
+            if include_layer:
+                writer.writerow({
+                    "layer": "qkv_proj",
+                    "tokens": 16,
+                    "time_us": 2.5,
+                })
+        return variant_root
+
+    def _source(self, root):
+        return ProfileBundleHBFPerformanceSource(
+            profile_root=root,
+            profile_hardware="B200_HBF",
+            model="meta-llama/Llama-3.1-8B",
+            variant="bf16",
+            tp_needed={1},
+            model_type="llama",
+        )
+
+    def test_external_bundle_returns_direct_operator_latency(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._bundle(td)
+            source = self._source(td)
+
+            latency = source.latency_ns(_query())
+
+            self.assertEqual(latency, 2500)
+            self.assertEqual(
+                source.describe()["evidence_level"],
+                "external-simulator-backed",
+            )
+
+    def test_missing_layer_never_falls_back_to_baseline(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._bundle(td, include_layer=False)
+            source = self._source(td)
+
+            with self.assertRaisesRegex(KeyError, "Missing dense profile"):
+                source.latency_ns(_query())
+
+    def test_provenance_and_tp_coverage_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._bundle(td, producer="")
+            with self.assertRaisesRegex(ValueError, "producer"):
+                self._source(td)
+
+        with tempfile.TemporaryDirectory() as td:
+            self._bundle(td)
+            with self.assertRaisesRegex(FileNotFoundError, "tp=\\[2\\]"):
+                ProfileBundleHBFPerformanceSource(
+                    profile_root=td,
+                    profile_hardware="B200_HBF",
+                    model="meta-llama/Llama-3.1-8B",
+                    variant="bf16",
+                    tp_needed={2},
+                    model_type="llama",
+                )
 
 
 if __name__ == "__main__":

@@ -328,13 +328,37 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
     """
-    cache_key = (hardware, model, variant)
+    root = _variant_root(hardware, model, variant)
+    return _load_perf_db_at_variant_root(
+        root,
+        hardware,
+        model,
+        variant,
+        tp_needed,
+        model_type,
+    )
+
+
+def _load_perf_db_at_variant_root(
+    root,
+    hardware,
+    model,
+    variant,
+    tp_needed,
+    model_type,
+):
+    """Load a profile bundle from an explicit variant directory."""
+    cache_key = (
+        os.path.abspath(root),
+        hardware,
+        model,
+        variant,
+    )
     if cache_key in _perf_db_cache:
         db = _perf_db_cache[cache_key]
         _check_tp_coverage(db, tp_needed, hardware, model, variant)
         return db
 
-    root = _variant_root(hardware, model, variant)
     if not os.path.isdir(root):
         raise FileNotFoundError(
             f"Profile variant folder not found: {root}. Run the profiler "
@@ -382,6 +406,7 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         "variant": variant,
         "hardware": hardware,
         "model": model,
+        "profile_root": os.path.abspath(root),
         "available_tps": sorted(available_tps),
         "tables": tables_per_tp,
     }
