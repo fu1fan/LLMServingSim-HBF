@@ -6,6 +6,7 @@ import os
 import shutil
 from .utils import get_config
 from .pim_model import PIMModel
+from .hbf_model import parse_hbf_config
 from .logger import get_logger
 
 class FlowStyleList(list): pass
@@ -410,6 +411,19 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             # Resolve tp_size, pp_size, ep_size from partial config
             model_config = get_config(instance["model_name"])
             _resolve_parallelism(instance, model_config)
+
+            hbf_config = parse_hbf_config(instance.get("hbf_mem"))
+            if hbf_config is not None:
+                instance["hbf_mem"] = hbf_config.to_dict()
+                logger.info(
+                    "HBF configured for %s: %d stacks, %.2fGB per stack, "
+                    "%.2fGB total, performance source=%s",
+                    instance["model_name"],
+                    hbf_config.num_stacks,
+                    hbf_config.stack_capacity_gb,
+                    hbf_config.capacity_bytes / (1024 ** 3),
+                    hbf_config.performance["source"],
+                )
 
             instance["node_id"] = node_id
             instance["instance_id"] = inst_id
