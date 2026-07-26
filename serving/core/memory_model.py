@@ -3,6 +3,8 @@ from .utils import get_config
 from .radix_tree import *
 import logging
 from enum import Enum
+from .config_builder import get_device
+from .hbf_model import HBFAllocationKind, HBFMemory, is_hbf_location
 
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
@@ -12,9 +14,31 @@ class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
+    HBF = 4
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
+    def __init__(
+        self,
+        model,
+        instance_id,
+        node_id,
+        num_npus,
+        tp_size,
+        npu_mem,
+        cpu_mem,
+        block_size,
+        fp,
+        enable_prefix_caching,
+        enable_prefix_sharing,
+        prefix_pool,
+        prefix_storage,
+        cxl_mem=0,
+        ep_size=1,
+        pp_size=1,
+        kv_cache_dtype='auto',
+        placement=None,
+        hbf_mem=None,
+    ):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -31,6 +55,13 @@ class MemoryModel():
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
+        self.placement = placement
+        self.hbf_memory = None
+        if hbf_mem is not None:
+            self.hbf_memory = HBFMemory(
+                num_stacks=hbf_mem["num_stacks"],
+                stack_capacity_gb=hbf_mem["stack_capacity_gb"],
+            )
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -50,14 +81,38 @@ class MemoryModel():
 
         # Memory model
         self.weight = self.get_weight() # assume weight is loaded
-        self.npu_used = self.weight
+        if self.hbf_memory is None:
+            # Preserve the exact upstream accounting path when HBF is absent.
+            self.hbm_weight = self.weight
+            self.hbf_weight = 0
+        else:
+            self.hbm_weight, self.hbf_weight = (
+                self._get_weight_residency()
+            )
+            if self.hbf_weight > self.hbf_memory.capacity_bytes:
+                raise RuntimeError(
+                    f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] "
+                    "HBF weight capacity exceeded: "
+                    f"required={self.hbf_weight} "
+                    f"available={self.hbf_memory.capacity_bytes}"
+                )
+            self.hbf_memory.allocate(
+                self.hbf_weight,
+                HBFAllocationKind.WEIGHT,
+            )
+
+        self.npu_used = self.hbm_weight
         self.cpu_used = 0
-        if self.weight > self.npu_mem:
-            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.num_npus//GB_TO_BYTE}GB")
+        if self.hbm_weight > self.npu_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] "
+                "HBM weight capacity exceeded: "
+                f"required={self.hbm_weight} available={self.npu_mem}"
+            )
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
-            self.mem_for_kv = self.npu_mem - self.weight
+            self.mem_for_kv = self.npu_mem - self.hbm_weight
             self.npu_prefix_cache = RadixCache(device='NPU', 
                                                node_id=self.node_id,
                                                instance_id=self.instance_id,
@@ -143,6 +198,56 @@ class MemoryModel():
             block_weight += ffn2_w
         return block_weight
 
+    def _get_weight_residency(self):
+        """Return per-rank static weight bytes in HBM and HBF."""
+        if self.placement is None:
+            return self.weight, 0
+
+        hbm_weight = 0
+        hbf_weight = 0
+        tp = self.tp_size
+        ep = self.ep_size
+        fp = self.fp
+
+        def add(layer_name, block_idx, parallel):
+            nonlocal hbm_weight, hbf_weight
+            _, weight_size, _ = calculate_sizes(
+                self.model,
+                layer_name,
+                1,
+                parallel=parallel,
+                fp=fp,
+            )
+            location = get_device(
+                self.placement,
+                block_idx,
+                layer_name,
+                "weights",
+            )
+            if is_hbf_location(location):
+                hbf_weight += weight_size
+            else:
+                hbm_weight += weight_size
+
+        add("embedding", None, tp)
+        block_count = self.n_layer // max(self.pp_size, 1)
+        for block_idx in range(block_count):
+            add("layernorm", block_idx, tp)
+            add("qkv_proj", block_idx, tp)
+            if str(self.config.get("model_type", "")).startswith("qwen3"):
+                add("qk_norm", block_idx, tp)
+            add("o_proj", block_idx, tp)
+            add("layernorm", block_idx, tp)
+            if self.is_moe:
+                add("moe", block_idx, ep)
+            else:
+                add("gate_up_proj", block_idx, tp)
+                add("down_proj", block_idx, tp)
+        add("final_layernorm", None, tp)
+        add("lm_head", None, tp)
+
+        return hbm_weight, hbf_weight
+
     def get_kv(self, seq):
         # shape of kv cache
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
@@ -219,18 +324,23 @@ class MemoryModel():
         return evict_size
 
     def free_weight(self):
-        if self.npu_used - self.weight < 0:
+        if self.npu_used - self.hbm_weight < 0:
             raise RuntimeError(
-                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
+                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.hbm_weight / MB_TO_BYTE:.2f}MB "
                 f"but only {self.npu_used / MB_TO_BYTE:.2f}MB is used."
             )
         self.logger.info(
             "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
             self.npu_used / MB_TO_BYTE,
-            self.weight / MB_TO_BYTE,
-            (self.npu_used - self.weight) / MB_TO_BYTE,
+            self.hbm_weight / MB_TO_BYTE,
+            (self.npu_used - self.hbm_weight) / MB_TO_BYTE,
         )
-        self.npu_used -= self.weight
+        self.npu_used -= self.hbm_weight
+        if self.hbf_memory is not None:
+            self.hbf_memory.free(
+                self.hbf_weight,
+                HBFAllocationKind.WEIGHT,
+            )
 
     def is_free(self):
         is_free = self.npu_used == 0 and self.cpu_used == 0
@@ -282,9 +392,9 @@ class MemoryModel():
     
     def free(self, size, device):
         if device == Device.NPU:
-            if self.npu_used - size < self.weight:
+            if self.npu_used - size < self.hbm_weight:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.weight) / MB_TO_BYTE:.2f}MB is used."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.hbm_weight) / MB_TO_BYTE:.2f}MB is used."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",

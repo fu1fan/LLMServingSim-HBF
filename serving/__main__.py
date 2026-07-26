@@ -461,6 +461,8 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            placement=placement[instance_id],
+            hbf_mem=instance.get("hbf_mem"),
         ))
 
     # Controller for astra-sim process communication
