@@ -7,6 +7,28 @@ from types import MappingProxyType
 from .hbf_model import is_hbf_location
 
 
+def apply_hbf_latency_scale_override(instances, latency_scale):
+    if latency_scale is None:
+        return
+    if latency_scale <= 0:
+        raise ValueError("--hbf-latency-scale must be positive")
+
+    hbf_instances = [
+        instance for instance in instances if instance.get("hbf_mem")
+    ]
+    if not hbf_instances:
+        raise ValueError(
+            "--hbf-latency-scale requires at least one hbf_mem instance"
+        )
+    for instance in hbf_instances:
+        performance = instance["hbf_mem"]["performance"]
+        if performance["source"] != "scale":
+            raise ValueError(
+                "--hbf-latency-scale cannot override an HBF profile source"
+            )
+        performance["latency_scale"] = float(latency_scale)
+
+
 @dataclass(frozen=True)
 class HBFOperatorQuery:
     model: str
@@ -67,3 +89,25 @@ class IdentityHBFPerformanceSource(HBFPerformanceSource):
 
     def latency_ns(self, query):
         return query.baseline_latency_ns
+
+
+class ScaleHBFPerformanceSource(HBFPerformanceSource):
+    source_name = "scale"
+    evidence_level = "sensitivity-analysis"
+
+    def __init__(self, latency_scale):
+        if (
+            not isinstance(latency_scale, (int, float))
+            or isinstance(latency_scale, bool)
+            or latency_scale <= 0
+        ):
+            raise ValueError("HBF latency_scale must be a positive number")
+        self.latency_scale = float(latency_scale)
+
+    def latency_ns(self, query):
+        return int(round(query.baseline_latency_ns * self.latency_scale))
+
+    def describe(self):
+        value = super().describe()
+        value["latency_scale"] = self.latency_scale
+        return value

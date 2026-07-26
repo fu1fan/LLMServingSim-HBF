@@ -23,6 +23,7 @@ from serving.core.graph_generator import *
 from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
+from serving.core.hbf_performance import apply_hbf_latency_scale_override
 from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
@@ -291,6 +292,8 @@ def main():
                         help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--hbf-latency-scale', type=float, default=None,
+                        help='override the coefficient for every scale-based HBF instance in this run')
 
     args = parser.parse_args()
     
@@ -330,6 +333,7 @@ def main():
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
+    apply_hbf_latency_scale_override(instances, args.hbf_latency_scale)
     inst2node_mapping = cluster["inst2node_mapping"]
     inst2npu_mapping = cluster["inst2npu_mapping"]
     npu2inst_mapping = cluster["npu2inst_mapping"]

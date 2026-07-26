@@ -3,6 +3,7 @@ import unittest
 from serving.core.hbf_performance import (
     HBFOperatorQuery,
     IdentityHBFPerformanceSource,
+    ScaleHBFPerformanceSource,
 )
 
 
@@ -50,6 +51,35 @@ class HBFPerformanceInterfaceTest(unittest.TestCase):
             _query(baseline_latency_ns=-1)
         with self.assertRaisesRegex(ValueError, "weight_bytes"):
             _query(weight_bytes=-1)
+
+
+class ScaleHBFPerformanceTest(unittest.TestCase):
+    def test_scale_multiplies_complete_operator_latency(self):
+        source = ScaleHBFPerformanceSource(1.25)
+
+        self.assertEqual(
+            source.latency_ns(_query(baseline_latency_ns=1000)),
+            1250,
+        )
+        self.assertEqual(source.describe(), {
+            "source": "scale",
+            "evidence_level": "sensitivity-analysis",
+            "latency_scale": 1.25,
+        })
+
+    def test_identity_scale_is_numerically_exact(self):
+        source = ScaleHBFPerformanceSource(1.0)
+
+        self.assertEqual(
+            source.latency_ns(_query(baseline_latency_ns=1234567)),
+            1234567,
+        )
+
+    def test_invalid_scale_is_rejected(self):
+        for value in (0, -1, True, "2"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ScaleHBFPerformanceSource(value)
 
 
 if __name__ == "__main__":
