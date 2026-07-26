@@ -114,6 +114,32 @@ class ScaleHBFPerformanceSource(HBFPerformanceSource):
         return value
 
 
+def build_hbf_performance_source(
+    hbf_mem,
+    model,
+    variant,
+    tp_needed,
+    model_type,
+):
+    """Construct the configured source, or ``None`` for legacy instances."""
+    if hbf_mem is None:
+        return None
+    performance = hbf_mem["performance"]
+    source = performance["source"]
+    if source == "scale":
+        return ScaleHBFPerformanceSource(performance["latency_scale"])
+    if source == "profile":
+        return ProfileBundleHBFPerformanceSource(
+            performance["profile_root"],
+            performance["profile_hardware"],
+            model,
+            variant,
+            tp_needed,
+            model_type,
+        )
+    raise ValueError(f"Unsupported HBF performance source {source!r}")
+
+
 class ProfileBundleHBFPerformanceSource(HBFPerformanceSource):
     source_name = "profile"
     evidence_level = "external-simulator-backed"

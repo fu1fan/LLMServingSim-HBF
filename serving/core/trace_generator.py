@@ -7,6 +7,11 @@ import yaml
 from .memory_model import calculate_sizes
 from .gate_function import GateRouter
 from .config_builder import get_device
+from .hbf_model import is_hbf_location, lower_hbf_trace_location
+from .hbf_performance import (
+    HBFOperatorQuery,
+    build_hbf_performance_source,
+)
 from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
 from .logger import get_logger
@@ -111,6 +116,7 @@ class TraceCtx:
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
+    hbf_performance_source: object  # HBFPerformanceSource or None
 
 
 @dataclass
@@ -855,7 +861,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                     hbf_mem=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -872,6 +879,13 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     kv_head = config.get('num_key_value_heads', n_head)
     head_dim = config.get('head_dim', n_embd // n_head)
     is_moe = gate is not None
+    hbf_performance_source = build_hbf_performance_source(
+        hbf_mem,
+        model,
+        variant,
+        tp_needed,
+        model_type,
+    )
 
     pim_channels = 0
     if enable_attn_offloading and pim_model is not None:
@@ -888,6 +902,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        hbf_performance_source=hbf_performance_source,
     )
 
 
@@ -946,6 +961,64 @@ def _layer_category(perf_db, layer_name):
     return None
 
 
+def _hbf_shape_key(category, bctx, activated_experts=None):
+    if category == "per_sequence":
+        return {"sequences": bctx.lm_head_len}
+    if category == "attention":
+        return {
+            "prefill_chunk": bctx.prefill_chunk,
+            "kv_prefill": bctx.kv_prefill,
+            "n_decode": bctx.n_decode,
+            "kv_decode_mean": bctx.kv_decode_mean,
+            "kv_decode_max": bctx.kv_decode_max,
+            "kv_decode_min": bctx.kv_decode_min,
+        }
+    if category == "moe":
+        return {
+            "tokens": bctx.total_len,
+            "activated_experts": max(int(activated_experts or 0), 1),
+        }
+    return {"tokens": bctx.total_len}
+
+
+def _apply_hbf_performance(
+    ctx,
+    bctx,
+    layer_name,
+    category,
+    baseline_latency_ns,
+    weight_bytes,
+    weight_location,
+    activated_experts=None,
+):
+    query = HBFOperatorQuery(
+        model=ctx.model,
+        variant=ctx.perf_db["variant"],
+        tp_size=ctx.tp_size,
+        ep_size=ctx.ep_total,
+        layer_name=layer_name,
+        category=category,
+        shape=_hbf_shape_key(category, bctx, activated_experts),
+        baseline_latency_ns=baseline_latency_ns,
+        weight_bytes=weight_bytes,
+        weight_location=weight_location,
+    )
+    if not query.uses_hbf_weights:
+        return baseline_latency_ns
+    if ctx.hbf_performance_source is None:
+        raise RuntimeError(
+            f"HBF weights for layer {layer_name!r} have no performance source"
+        )
+    return ctx.hbf_performance_source.latency_ns(query)
+
+
+def _counts_as_dram_weight_traffic(weight_location):
+    return (
+        weight_location != "LOCAL"
+        and not is_hbf_location(weight_location)
+    )
+
+
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
                 comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL'):
     """Emit a single trace layer: lookup latency, compute sizes, format, track power."""
@@ -980,12 +1053,22 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
                                        parallel=ctx.tp_size, fp=ctx.fp)
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
+    latency_ns = _apply_hbf_performance(
+        ctx,
+        bctx,
+        layer_name,
+        category,
+        latency_ns,
+        wt,
+        wt_loc,
+    )
+    trace_wt_loc = lower_hbf_trace_location(wt_loc)
 
-    lines.append(formatter(layer_name, str(latency_ns), input_loc, str(inp), wt_loc, str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
+    lines.append(formatter(layer_name, str(latency_ns), input_loc, str(inp), trace_wt_loc, str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
 
     if power_acc is not None:
         power_acc.npu_latencies_ns.append(latency_ns)
-        if wt_loc != 'LOCAL':
+        if _counts_as_dram_weight_traffic(wt_loc):
             power_acc.dram_weight_bytes += wt
         if comm_size > 0:
             collective = comm_type.split(':', 1)[0].lower()
@@ -1021,7 +1104,9 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
             pim_lat = int(ctx.pim_model.get_pim_latency(ctx.n_head, ctx.kv_head, ctx.head_dim, L, bctx.channel_split))
             lines.append(formatter("attention", str(pim_lat),
                 f'REMOTE:{ctx.node_id}.{ch}', str(inp),
-                get_device(ctx.placement, layer_num, "attention", "weights"), '0',
+                lower_hbf_trace_location(get_device(
+                    ctx.placement, layer_num, "attention", "weights"
+                )), '0',
                 f'REMOTE:{ctx.node_id}.{ch}', str(out),
                 'NONE', '0', batch_tag))
             if power_acc is not None and pim_lat > 0:
@@ -1110,12 +1195,23 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
             rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
             rank_inp, rank_wt, rank_out = calculate_sizes(
                 ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
+            rank_latency_ns = _apply_hbf_performance(
+                ctx,
+                bctx,
+                "moe",
+                "moe",
+                rank_latency_ns,
+                rank_wt,
+                wt_loc,
+                activated_experts=activated_experts,
+            )
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
             lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
-                wt_loc, str(rank_wt), 'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
+                lower_hbf_trace_location(wt_loc), str(rank_wt),
+                'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
 
-            if power_acc is not None and wt_loc != 'LOCAL':
+            if power_acc is not None and _counts_as_dram_weight_traffic(wt_loc):
                 power_acc.dram_weight_bytes += rank_wt
 
     # Power: all local GPUs are active for the duration of the slowest rank
@@ -1237,21 +1333,56 @@ def _build_transformer_block(ctx, bctx, layer_num, batch_tag, batch_id_str):
 # Final layers and power helpers
 # ======================================================================
 
-def _layer_latency_for_power(ctx, bctx, layer_name):
+def _layer_latency_for_power(ctx, bctx, layer_name, layer_num=None):
     """Per-layer latency lookup used purely for power accounting; the
     trace writes its own values via _emit_layer and _emit_moe_block.
     """
     category = _layer_category(ctx.perf_db, layer_name)
     if category == "per_sequence":
-        return _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
-    if category == "attention":
-        return _lookup_attention_with_skew(
+        latency_ns = _lookup_per_sequence(
+            ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len
+        )
+    elif category == "attention":
+        latency_ns = _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
             bctx.prefill_chunk, bctx.kv_prefill,
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
         )
-    return _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
+    else:
+        latency_ns = _lookup_dense(
+            ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len
+        )
+    if layer_name == "attention":
+        kv_len = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
+        _, weight_bytes, _ = calculate_sizes(
+            ctx.model,
+            layer_name,
+            bctx.total_len,
+            kv_len=kv_len,
+            parallel=ctx.tp_size,
+            fp=ctx.fp,
+        )
+    else:
+        _, weight_bytes, _ = calculate_sizes(
+            ctx.model,
+            layer_name,
+            bctx.total_len,
+            parallel=ctx.tp_size,
+            fp=ctx.fp,
+        )
+    weight_location = get_device(
+        ctx.placement, layer_num, layer_name, "weights"
+    )
+    return _apply_hbf_performance(
+        ctx,
+        bctx,
+        layer_name,
+        category,
+        latency_ns,
+        weight_bytes,
+        weight_location,
+    )
 
 
 def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
@@ -1271,7 +1402,10 @@ def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
         for layer_name in head_layers:
             lat = _layer_latency_for_power(ctx, bctx, layer_name)
             ctx.power_model.add_npu_active_energy_consumption(ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
-            if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
+            weight_location = get_device(
+                ctx.placement, None, layer_name, "weights"
+            )
+            if _counts_as_dram_weight_traffic(weight_location):
                 _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
@@ -1311,7 +1445,10 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
             lat = _layer_latency_for_power(ctx, bctx, layer_name)
             ctx.power_model.add_npu_active_energy_consumption(
                 ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
-            if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
+            weight_location = get_device(
+                ctx.placement, None, layer_name, "weights"
+            )
+            if _counts_as_dram_weight_traffic(weight_location):
                 _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
@@ -1321,13 +1458,16 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                      hbf_mem=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim,
+                           dp_sum_total_len=dp_sum_total_len,
+                           hbf_mem=hbf_mem)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1374,13 +1514,16 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                                  hbf_mem=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim,
+                           dp_sum_total_len=dp_sum_total_len,
+                           hbf_mem=hbf_mem)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1475,7 +1618,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                   enable_block_copy=True, inputs_root=None, hbf_mem=None):
 
     model = batch.model
     config = get_config(model)
@@ -1526,7 +1670,9 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
-                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                        tp_dim=tp_dim, ep_dim=ep_dim,
+                        dp_sum_total_len=dp_sum_total_len,
+                        hbf_mem=hbf_mem)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:
