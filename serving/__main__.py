@@ -31,7 +31,11 @@ from serving.core.hbf_summary import (
 from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
-from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.run_paths import (
+    build_run_paths,
+    resolve_run_id,
+    resolve_user_input_path,
+)
 import sys as flush
 
 from pyinstrument import Profiler
@@ -72,9 +76,7 @@ def _runtime_limit(value):
 
 
 def _cluster_config_path(path):
-    if os.path.isabs(path):
-        return path
-    return os.path.join("..", path)
+    return resolve_user_input_path(path)
 
 
 def _load_cluster_config_for_overrides(path):

@@ -8,6 +8,7 @@ from .utils import get_config
 from .pim_model import PIMModel
 from .hbf_model import is_hbf_location, parse_hbf_config
 from .logger import get_logger
+from .run_paths import resolve_user_input_path
 
 class FlowStyleList(list): pass
 
@@ -272,7 +273,7 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 # parse cluster configuration from JSON file and build config file for astra-sim
 def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
-    cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
+    cluster_config_path = resolve_user_input_path(cluster_config_path)
     
     try:
         with open(cluster_config_path, 'r') as f:
