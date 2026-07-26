@@ -24,6 +24,10 @@ from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
 from serving.core.hbf_performance import apply_hbf_latency_scale_override
+from serving.core.hbf_summary import (
+    build_hbf_runtime_summary,
+    write_json_output,
+)
 from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
@@ -294,6 +298,9 @@ def main():
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
     parser.add_argument('--hbf-latency-scale', type=float, default=None,
                         help='override the coefficient for every scale-based HBF instance in this run')
+    parser.add_argument('--hbf-summary-output', type=str, default=None,
+                        help='write HBF capacity, timing-source, and evidence metadata as JSON. '
+                        'Supports {run_id} placeholder')
 
     args = parser.parse_args()
     
@@ -301,6 +308,9 @@ def main():
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+    args.hbf_summary_output = _resolve_output_file(
+        args.hbf_summary_output, args.run_id
+    )
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -1039,6 +1049,14 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+
+    if args.hbf_summary_output is not None:
+        write_json_output(
+            args.hbf_summary_output,
+            build_hbf_runtime_summary(
+                instances, schedulers, total_npu, args.run_id
+            ),
+        )
 
     if args.cleanup_inputs:
         _cleanup_inputs_root(run_paths, logger)
