@@ -12,6 +12,13 @@ class HBFRuntimeSummaryTest(unittest.TestCase):
             hbm_weight=128,
             hbf_weight=512,
             hbf_memory=hbf_memory,
+            weight_residency_by_pp_rank=[
+                {
+                    "pp_rank": 0,
+                    "hbm_weight_used_bytes": 128,
+                    "hbf_weight_used_bytes": 512,
+                }
+            ],
         )
         instance = {
             "model_name": "model",
@@ -42,6 +49,9 @@ class HBFRuntimeSummaryTest(unittest.TestCase):
         self.assertEqual(row["hbf_weight_used_bytes"], 512)
         self.assertEqual(row["latency_scale"], 1.5)
         self.assertEqual(row["evidence_level"], "sensitivity-analysis")
+        self.assertEqual(
+            row["weight_residency_by_pp_rank"][0]["pp_rank"], 0
+        )
 
 
 if __name__ == "__main__":

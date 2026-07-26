@@ -112,6 +112,44 @@ class HBFWeightResidencyTest(unittest.TestCase):
         self.assertLess(tp2.weight, tp1.weight)
         self.assertLess(tp2pp2.weight, tp2.weight)
 
+    def test_pp_residency_uses_global_blocks_and_stage_local_heads(self):
+        placement = _placement("LOCAL")
+        placement["block"] = [
+            {
+                "weights": "HBF" if block < 16 else "LOCAL",
+                "kv_loc": "LOCAL",
+                "kv_evict_loc": "REMOTE:0",
+            }
+            for block in range(32)
+        ]
+        memory = _memory(
+            placement=placement,
+            hbf_mem=_hbf_config(),
+            pp=2,
+        )
+
+        stages = memory.weight_residency_by_pp_rank
+        self.assertEqual(len(stages), 2)
+        self.assertEqual(
+            (stages[0]["block_start"], stages[0]["block_end"]),
+            (0, 16),
+        )
+        self.assertEqual(
+            (stages[1]["block_start"], stages[1]["block_end"]),
+            (16, 32),
+        )
+        self.assertGreater(stages[0]["hbf_weight_used_bytes"], 0)
+        self.assertEqual(stages[1]["hbf_weight_used_bytes"], 0)
+        self.assertGreater(stages[1]["hbm_weight_used_bytes"], 0)
+        self.assertEqual(
+            memory.hbf_weight,
+            stages[0]["hbf_weight_used_bytes"],
+        )
+        self.assertEqual(
+            memory.hbm_weight,
+            max(row["hbm_weight_used_bytes"] for row in stages),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

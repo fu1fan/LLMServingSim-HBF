@@ -38,6 +38,9 @@ def build_hbf_runtime_summary(instances, schedulers, num_devices, run_id):
                     else 0
                 ),
                 "hbf_weight_used_bytes": memory.hbf_weight,
+                "weight_residency_by_pp_rank": (
+                    memory.weight_residency_by_pp_rank
+                ),
                 "timing_source": source,
                 "latency_scale": performance.get("latency_scale"),
                 "profile_root": performance.get("profile_root"),

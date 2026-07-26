@@ -57,6 +57,7 @@ class MemoryModel():
         self.prefix_storage = prefix_storage
         self.placement = placement
         self.hbf_memory = None
+        self.weight_residency_by_pp_rank = None
         if hbf_mem is not None:
             self.hbf_memory = HBFMemory(
                 num_stacks=hbf_mem["num_stacks"],
@@ -199,54 +200,79 @@ class MemoryModel():
         return block_weight
 
     def _get_weight_residency(self):
-        """Return per-rank static weight bytes in HBM and HBF."""
+        """Return worst-rank HBM/HBF residency across all PP stages."""
         if self.placement is None:
             return self.weight, 0
 
-        hbm_weight = 0
-        hbf_weight = 0
         tp = self.tp_size
         ep = self.ep_size
         fp = self.fp
+        pp = max(self.pp_size, 1)
+        stage_rows = []
 
-        def add(layer_name, block_idx, parallel):
-            nonlocal hbm_weight, hbf_weight
-            _, weight_size, _ = calculate_sizes(
-                self.model,
-                layer_name,
-                1,
-                parallel=parallel,
-                fp=fp,
+        for pp_rank in range(pp):
+            stage_hbm = 0
+            stage_hbf = 0
+
+            def add(layer_name, block_idx, parallel):
+                nonlocal stage_hbm, stage_hbf
+                _, weight_size, _ = calculate_sizes(
+                    self.model,
+                    layer_name,
+                    1,
+                    parallel=parallel,
+                    fp=fp,
+                )
+                location = get_device(
+                    self.placement,
+                    block_idx,
+                    layer_name,
+                    "weights",
+                )
+                if is_hbf_location(location):
+                    stage_hbf += weight_size
+                else:
+                    stage_hbm += weight_size
+
+            if pp_rank == 0:
+                add("embedding", None, tp)
+
+            block_start = pp_rank * self.n_layer // pp
+            block_end = (pp_rank + 1) * self.n_layer // pp
+            for block_idx in range(block_start, block_end):
+                add("layernorm", block_idx, tp)
+                add("qkv_proj", block_idx, tp)
+                if str(self.config.get("model_type", "")).startswith(
+                    "qwen3"
+                ):
+                    add("qk_norm", block_idx, tp)
+                add("o_proj", block_idx, tp)
+                add("layernorm", block_idx, tp)
+                if self.is_moe:
+                    add("moe", block_idx, ep)
+                else:
+                    add("gate_up_proj", block_idx, tp)
+                    add("down_proj", block_idx, tp)
+
+            if pp_rank == pp - 1:
+                add("final_layernorm", None, tp)
+                add("lm_head", None, tp)
+
+            stage_rows.append(
+                {
+                    "pp_rank": pp_rank,
+                    "block_start": block_start,
+                    "block_end": block_end,
+                    "hbm_weight_used_bytes": stage_hbm,
+                    "hbf_weight_used_bytes": stage_hbf,
+                }
             )
-            location = get_device(
-                self.placement,
-                block_idx,
-                layer_name,
-                "weights",
-            )
-            if is_hbf_location(location):
-                hbf_weight += weight_size
-            else:
-                hbm_weight += weight_size
 
-        add("embedding", None, tp)
-        block_count = self.n_layer // max(self.pp_size, 1)
-        for block_idx in range(block_count):
-            add("layernorm", block_idx, tp)
-            add("qkv_proj", block_idx, tp)
-            if str(self.config.get("model_type", "")).startswith("qwen3"):
-                add("qk_norm", block_idx, tp)
-            add("o_proj", block_idx, tp)
-            add("layernorm", block_idx, tp)
-            if self.is_moe:
-                add("moe", block_idx, ep)
-            else:
-                add("gate_up_proj", block_idx, tp)
-                add("down_proj", block_idx, tp)
-        add("final_layernorm", None, tp)
-        add("lm_head", None, tp)
-
-        return hbm_weight, hbf_weight
+        self.weight_residency_by_pp_rank = stage_rows
+        return (
+            max(row["hbm_weight_used_bytes"] for row in stage_rows),
+            max(row["hbf_weight_used_bytes"] for row in stage_rows),
+        )
 
     def get_kv(self, seq):
         # shape of kv cache
