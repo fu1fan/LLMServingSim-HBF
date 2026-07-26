@@ -8,6 +8,15 @@ from serving.core.trace_generator import (
 )
 
 
+class CapturingSource:
+    def __init__(self):
+        self.query = None
+
+    def latency_ns(self, query):
+        self.query = query
+        return query.baseline_latency_ns
+
+
 def _context(source):
     return SimpleNamespace(
         model="facebook/opt-125m",
@@ -72,6 +81,24 @@ class HBFTraceIntegrationTest(unittest.TestCase):
         self.assertFalse(_counts_as_dram_weight_traffic("HBF"))
         self.assertTrue(_counts_as_dram_weight_traffic("REMOTE:0"))
         self.assertTrue(_counts_as_dram_weight_traffic("CXL:0"))
+
+    def test_moe_query_uses_post_routing_local_tokens(self):
+        source = CapturingSource()
+        _apply_hbf_performance(
+            _context(source),
+            _batch(),
+            "moe",
+            "moe",
+            100,
+            4096,
+            "HBF",
+            activated_experts=3,
+            tokens=7,
+        )
+        self.assertEqual(source.query.shape_key["tokens"], 7)
+        self.assertEqual(
+            source.query.shape_key["activated_experts"], 3
+        )
 
 
 if __name__ == "__main__":

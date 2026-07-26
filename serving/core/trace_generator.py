@@ -961,7 +961,12 @@ def _layer_category(perf_db, layer_name):
     return None
 
 
-def _hbf_shape_key(category, bctx, activated_experts=None):
+def _hbf_shape_key(
+    category,
+    bctx,
+    activated_experts=None,
+    tokens=None,
+):
     if category == "per_sequence":
         return {"sequences": bctx.lm_head_len}
     if category == "attention":
@@ -975,7 +980,9 @@ def _hbf_shape_key(category, bctx, activated_experts=None):
         }
     if category == "moe":
         return {
-            "tokens": bctx.total_len,
+            "tokens": (
+                bctx.total_len if tokens is None else int(tokens)
+            ),
             "activated_experts": max(int(activated_experts or 0), 1),
         }
     return {"tokens": bctx.total_len}
@@ -990,6 +997,7 @@ def _apply_hbf_performance(
     weight_bytes,
     weight_location,
     activated_experts=None,
+    tokens=None,
 ):
     query = HBFOperatorQuery(
         model=ctx.model,
@@ -998,7 +1006,12 @@ def _apply_hbf_performance(
         ep_size=ctx.ep_total,
         layer_name=layer_name,
         category=category,
-        shape=_hbf_shape_key(category, bctx, activated_experts),
+        shape=_hbf_shape_key(
+            category,
+            bctx,
+            activated_experts,
+            tokens,
+        ),
         baseline_latency_ns=baseline_latency_ns,
         weight_bytes=weight_bytes,
         weight_location=weight_location,
@@ -1204,6 +1217,7 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
                 rank_wt,
                 wt_loc,
                 activated_experts=activated_experts,
+                tokens=local_tokens,
             )
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
