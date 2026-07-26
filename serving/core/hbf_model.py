@@ -101,6 +101,15 @@ def parse_hbf_config(value):
     )
 
 
+def is_hbf_location(value):
+    return isinstance(value, str) and value.upper() == "HBF"
+
+
+def lower_hbf_trace_location(value):
+    """Lower logical HBF placement to ASTRA's existing local-memory path."""
+    return "LOCAL" if is_hbf_location(value) else value
+
+
 @dataclass
 class HBFMemory:
     """Track HBF capacity by allocation class.

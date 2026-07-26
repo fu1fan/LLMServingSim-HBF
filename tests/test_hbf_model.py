@@ -1,10 +1,16 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
+from serving.core.config_builder import _mem_str, _validate_memory_config
 from serving.core.hbf_model import (
     GB_TO_BYTE,
     HBFAllocationKind,
     HBFConfig,
     HBFMemory,
+    is_hbf_location,
+    lower_hbf_trace_location,
     parse_hbf_config,
 )
 
@@ -103,6 +109,61 @@ class HBFConfigTest(unittest.TestCase):
         value["schema_version"] = 1
         with self.assertRaisesRegex(ValueError, "latency_scale"):
             parse_hbf_config(value)
+
+
+class HBFPlacementTest(unittest.TestCase):
+    def test_hbf_is_a_logical_aggregate_location(self):
+        self.assertEqual(_mem_str("hbf", 0), "HBF")
+        self.assertTrue(is_hbf_location("HBF"))
+        self.assertEqual(lower_hbf_trace_location("HBF"), "LOCAL")
+
+        with self.assertRaisesRegex(ValueError, "Per-stack"):
+            _mem_str("hbf:0", 0)
+
+    def test_only_static_weights_may_use_hbf(self):
+        placement = [{
+            "default": {
+                "weights": "HBF",
+                "kv_loc": "LOCAL",
+                "kv_evict_loc": "REMOTE:0",
+            },
+            "block": [],
+            "layer": {},
+        }]
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.json"
+            path.write_text(
+                json.dumps({
+                    "remote_mem": {
+                        "memory-type": "PER_NODE_MEMORY_EXPANSION"
+                    }
+                }),
+                encoding="utf-8",
+            )
+            _validate_memory_config(
+                path,
+                placement,
+                enable_local_offloading=False,
+                allow_hbf=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "Not found"):
+                _validate_memory_config(
+                    path,
+                    placement,
+                    enable_local_offloading=False,
+                    allow_hbf=False,
+                )
+
+            placement[0]["default"]["kv_loc"] = "HBF"
+            with self.assertRaisesRegex(ValueError, "future offload"):
+                _validate_memory_config(
+                    path,
+                    placement,
+                    enable_local_offloading=False,
+                    allow_hbf=True,
+                )
 
 
 if __name__ == "__main__":

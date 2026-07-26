@@ -6,7 +6,7 @@ import os
 import shutil
 from .utils import get_config
 from .pim_model import PIMModel
-from .hbf_model import parse_hbf_config
+from .hbf_model import is_hbf_location, parse_hbf_config
 from .logger import get_logger
 
 class FlowStyleList(list): pass
@@ -650,7 +650,12 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     _create_network_config(network_config_path, total_instances, link_bw, link_latency)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
-    _validate_memory_config(memory_config_path, placement, enable_local_offloading)
+    _validate_memory_config(
+        memory_config_path,
+        placement,
+        enable_local_offloading,
+        allow_hbf=any(instance.get("hbf_mem") for instance in total_instances),
+    )
 
     cluster = {
         "num_nodes": num_nodes,
@@ -706,7 +711,12 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
     return
 
 # Validate memory configuration against placement settings
-def _validate_memory_config(memory_config_path, placement, enable_local_offloading):
+def _validate_memory_config(
+    memory_config_path,
+    placement,
+    enable_local_offloading,
+    allow_hbf=False,
+):
 
     # 1) Load memory_config
     try:
@@ -732,6 +742,8 @@ def _validate_memory_config(memory_config_path, placement, enable_local_offloadi
 
     def _ok(loc):
         """Allow LOCAL when local offloading is disabled; else must be in allowed set."""
+        if is_hbf_location(loc):
+            return allow_hbf
         loc_n = _norm(loc)
         if loc_n is None:
             return True
@@ -745,6 +757,11 @@ def _validate_memory_config(memory_config_path, placement, enable_local_offloadi
             return
         for kind in ("weights", "kv_loc", "kv_evict_loc"):
             if kind in entry and entry[kind] is not None:
+                if is_hbf_location(entry[kind]) and kind != "weights":
+                    raise ValueError(
+                        f"HBF {kind} is reserved for a future offload path "
+                        "and is not supported in the static-weight release."
+                    )
                 if not _ok(entry[kind]):
                     loc_n = _norm(entry[kind])
                     raise ValueError(
@@ -834,5 +851,11 @@ def _mem_str(loc, node_id):
         return f"REMOTE:{node_id}"
     elif loc.upper().startswith("CXL"):
         return loc.upper()
+    elif loc.upper() == "HBF":
+        return "HBF"
+    elif loc.upper().startswith("HBF:"):
+        raise ValueError(
+            "Per-stack HBF placement is not supported; use aggregate 'hbf'"
+        )
     else:
         raise ValueError(f"Unknown memory placement name '{loc}'")
