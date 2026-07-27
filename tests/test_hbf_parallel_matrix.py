@@ -261,6 +261,54 @@ class HbfParallelMatrixTests(unittest.TestCase):
         self.assertEqual(result, (spec.run_id, "skipped", 0))
         run.assert_not_called()
 
+    def test_completed_run_is_skipped_when_rerunning_failures(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"status": "completed"}),
+                encoding="utf-8",
+            )
+            with patch.object(matrix.subprocess, "run") as run:
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=True,
+                )
+        self.assertEqual(result, (spec.run_id, "skipped", 0))
+        run.assert_not_called()
+
+    def test_recorded_failure_runs_when_rerun_is_requested(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"status": "failed"}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                matrix.subprocess,
+                "run",
+                return_value=type("Result", (), {"returncode": 1})(),
+            ) as run:
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=True,
+                )
+        self.assertEqual(result, (spec.run_id, "failed", 1))
+        run.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

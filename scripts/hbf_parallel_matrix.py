@@ -525,11 +525,14 @@ def _positive_int(value):
 def _run_one(repo_root, manifest, spec, run_dir, command,
              code_sha, profile_bundle_sha, rerun_failed):
     previous_manifest = run_dir / "manifest.json"
-    if previous_manifest.is_file() and not rerun_failed:
+    if previous_manifest.is_file():
         previous = json.loads(
             previous_manifest.read_text(encoding="utf-8")
         )
-        if previous.get("status") in ("completed", "failed"):
+        previous_status = previous.get("status")
+        if previous_status == "completed":
+            return spec.run_id, "skipped", 0
+        if previous_status == "failed" and not rerun_failed:
             return spec.run_id, "skipped", 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
