@@ -454,6 +454,49 @@ class HbfParallelMatrixTests(unittest.TestCase):
         self.assertEqual(result[0:2], (124, "stall_timeout"))
         terminate.assert_called_once_with(process)
 
+    def test_collect_process_tree_is_deepest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = Path(directory)
+            for pid, start_time, children in (
+                (100, 1000, "101 102"),
+                (101, 1001, "103"),
+                (102, 1002, ""),
+                (103, 1003, ""),
+            ):
+                process_dir = proc_root / str(pid)
+                task_dir = process_dir / "task" / str(pid)
+                task_dir.mkdir(parents=True)
+                fields = ["S"] + ["0"] * 18 + [str(start_time)]
+                (process_dir / "stat").write_text(
+                    f"{pid} (worker {pid}) {' '.join(fields)}\n",
+                    encoding="utf-8",
+                )
+                (task_dir / "children").write_text(
+                    children,
+                    encoding="utf-8",
+                )
+
+            processes = matrix._collect_process_tree(100, proc_root)
+
+        self.assertEqual(
+            processes,
+            [(103, 1003), (101, 1001), (102, 1002), (100, 1000)],
+        )
+
+    def test_signal_processes_skips_reused_pid(self):
+        processes = [(101, 1001), (102, 1002)]
+        with (
+            patch.object(
+                matrix,
+                "_same_process",
+                side_effect=[False, True],
+            ),
+            patch.object(matrix.os, "kill") as kill,
+        ):
+            matrix._signal_processes(processes, matrix.signal.SIGTERM)
+
+        kill.assert_called_once_with(102, matrix.signal.SIGTERM)
+
 
 if __name__ == "__main__":
     unittest.main()

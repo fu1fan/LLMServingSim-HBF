@@ -579,21 +579,93 @@ def _read_progress_snapshot(log_path):
     }
 
 
+def _read_process_identity(pid, proc_root=Path("/proc")):
+    try:
+        stat = (proc_root / str(pid) / "stat").read_text(
+            encoding="utf-8"
+        )
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    closing_paren = stat.rfind(")")
+    if closing_paren < 0:
+        return None
+    fields = stat[closing_paren + 2:].split()
+    if len(fields) <= 19:
+        return None
+    return int(fields[19])
+
+
+def _read_process_children(pid, proc_root=Path("/proc")):
+    try:
+        text = (
+            proc_root / str(pid) / "task" / str(pid) / "children"
+        ).read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return ()
+    return tuple(int(child) for child in text.split())
+
+
+def _collect_process_tree(root_pid, proc_root=Path("/proc")):
+    """Snapshot descendants deepest-first, retaining PID identities."""
+    seen = set()
+    processes = []
+
+    def visit(pid):
+        if pid in seen:
+            return
+        seen.add(pid)
+        identity = _read_process_identity(pid, proc_root)
+        if identity is None:
+            return
+        for child in _read_process_children(pid, proc_root):
+            visit(child)
+        processes.append((pid, identity))
+
+    visit(root_pid)
+    return processes
+
+
+def _same_process(pid, identity):
+    return _read_process_identity(pid) == identity
+
+
+def _signal_processes(processes, sig):
+    for pid, identity in processes:
+        if not _same_process(pid, identity):
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
 def _terminate_process_group(process):
+    processes = _collect_process_tree(process.pid)
+    _signal_processes(processes, signal.SIGTERM)
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=10)
-        return
-    except subprocess.TimeoutExpired:
         pass
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if (
+            process.poll() is not None
+            and not any(_same_process(*item) for item in processes)
+        ):
+            process.wait()
+            return
+        time.sleep(0.1)
+
+    _signal_processes(processes, signal.SIGKILL)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        return
-    process.wait()
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _run_monitored_command(command, repo_root, log, log_path,
