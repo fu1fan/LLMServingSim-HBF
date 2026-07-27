@@ -15,4 +15,4 @@ VLLM_USE_PRECOMPILED=1 uv pip install vllm==0.19.0 --verbose --no-build-isolatio
 
 # Extra deps for workloads.generators (HF dataset loading) and
 # bench.core.plots (matplotlib).
-uv pip install datasets matplotlib
+uv pip install 'pandas>=2.2,<3' datasets matplotlib

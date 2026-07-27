@@ -1,0 +1,9 @@
+layer,sequences,time_us
+lm_head,1,199.039
+lm_head,2,198.142
+lm_head,3,205.151
+lm_head,4,207.295
+sampler,1,15.198
+sampler,2,15.393
+sampler,3,16.704
+sampler,4,16.928

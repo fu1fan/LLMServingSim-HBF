@@ -1,0 +1,84 @@
+[13:29:48] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/Qwen/Qwen3-235B-A22B.json 
+                    (model_type=qwen3_moe → architecture=qwen3_moe)             
+─────────── Profiling Qwen/Qwen3-235B-A22B on B200-smoke (qwen3_moe) ───────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1]                                             
+           INFO     Output root:                                                
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16     
+           INFO     → TP=1  booting vLLM engine                                 
+[13:30:05] INFO     ✓ TP=1  booting vLLM engine (16.2s)                         
+           INFO     TP=1 limits: num_cache_tokens=80358864 max_model_len=40960  
+                    max_num_batched_tokens=16 max_num_seqs=4 num_experts=128    
+                    top_k=8                                                     
+TP=1  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16/16 0:00:02 • 0:00:00
+[13:30:07] INFO     ✓ dense →                                                   
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16/tp1/
+                    dense.csv                                                   
+TP=1  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4/4 0:00:00 • 0:00:00
+[13:30:08] INFO     ✓ per_sequence →                                            
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16/tp1/
+                    per_sequence.csv                                            
+TP=1  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 9/9 0:00:01 • 0:00:00
+[13:30:09] INFO     ✓ attention →                                               
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16/tp1/
+                    attention.csv                                               
+TP=1  moe ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 15/15 0:00:01 • 0:00:00
+[13:30:10] INFO     ✓ moe →                                                     
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16/tp1/
+                    moe.csv                                                     
+[13:30:11] INFO     → replicating tp_stable layers across TP folders            
+           INFO     ✓ replicating tp_stable layers across TP folders (0.0s)     
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/root/LLMServingSim/profiler/__main__.py", line 435, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/root/LLMServingSim/profiler/__main__.py", line 419, in main
+    run_full(arch_path, profile_args, ns.out_root)
+  File "/root/LLMServingSim/profiler/core/runner.py", line 220, in run_full
+    persist_meta(args, arch_path, last_engine_kwargs, variant_root)
+  File "/root/LLMServingSim/profiler/core/writer.py", line 549, in persist_meta
+    "skew_fit": _skew_fit_block(variant_root, args.tp_degrees),
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/LLMServingSim/profiler/core/writer.py", line 321, in _skew_fit_block
+    from profiler.core.fit_alpha import fit_alpha_per_tp
+  File "/root/LLMServingSim/profiler/core/fit_alpha.py", line 76, in <module>
+    import pandas as pd
+ModuleNotFoundError: No module named 'pandas'
+[13:31:08] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/Qwen/Qwen3-235B-A22B.json 
+                    (model_type=qwen3_moe → architecture=qwen3_moe)             
+─────────── Profiling Qwen/Qwen3-235B-A22B on B200-smoke (qwen3_moe) ───────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1]                                             
+           INFO     Output root:                                                
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16     
+           INFO     → TP=1  booting vLLM engine                                 
+[13:31:16] INFO     ✓ TP=1  booting vLLM engine (8.1s)                          
+           INFO     TP=1 limits: num_cache_tokens=80358864 max_model_len=40960  
+                    max_num_batched_tokens=16 max_num_seqs=4 num_experts=128    
+                    top_k=8                                                     
+           INFO     dense resume: 112 prior rows preloaded, 16 prior shot keys  
+                    recognized                                                  
+           INFO     dense: skipping 16 already-measured shots, firing 0 new     
+           INFO     dense: nothing to do (all shots already measured)           
+           INFO     per_sequence resume: 8 prior rows preloaded, 4 prior shot   
+                    keys recognized                                             
+           INFO     per_sequence: skipping 4 already-measured shots, firing 0   
+                    new                                                         
+           INFO     per_sequence: nothing to do (all shots already measured)    
+           INFO     attention resume: 9 prior rows preloaded, 9 prior shot keys 
+                    recognized                                                  
+           INFO     attention: skipping 9 already-measured shots, firing 0 new  
+           INFO     attention: nothing to do (all shots already measured)       
+           INFO     moe resume: 15 prior rows preloaded, 15 prior shot keys     
+                    recognized                                                  
+           INFO     moe: skipping 15 already-measured shots, firing 0 new       
+           INFO     moe: nothing to do (all shots already measured)             
+[13:31:17] INFO     → replicating tp_stable layers across TP folders            
+           INFO     ✓ replicating tp_stable layers across TP folders (0.0s)     
+───────────────────────────────────── Done ─────────────────────────────────────
+           INFO     Results written to:                                         
+                    B200_profile/smoke/B200-smoke/Qwen/Qwen3-235B-A22B/bf16     

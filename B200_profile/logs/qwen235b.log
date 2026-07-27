@@ -1,0 +1,74 @@
+started_at_utc=2026-07-26T14:41:08Z
+pandas=2.3.3 torch=2.10.0+cu130 torch_cuda=13.0 vllm=0.19.0 gpu=NVIDIA B200
+[14:41:14] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/Qwen/Qwen3-235B-A22B.json 
+                    (model_type=qwen3_moe → architecture=qwen3_moe)             
+────────────── Profiling Qwen/Qwen3-235B-A22B on B200 (qwen3_moe) ──────────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4]                                       
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+           INFO     → TP=1  booting vLLM engine                                 
+[14:41:29] INFO     ✓ TP=1  booting vLLM engine (14.1s)                         
+           INFO     TP=1 limits: num_cache_tokens=79906496 max_model_len=40960  
+                    max_num_batched_tokens=2048 max_num_seqs=256 num_experts=128
+                    top_k=8                                                     
+TP=1  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:43 • 0:00:00
+[14:42:12] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp1/den
+                    se.csv                                                      
+TP=1  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:20 • 0:00:00
+[14:42:33] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp1/per
+                    _sequence.csv                                               
+TP=1  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:12:59 • 0:00:00
+[14:55:32] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp1/att
+                    ention.csv                                                  
+TP=1  moe ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 50/50 0:00:15 • 0:00:00
+[14:55:47] INFO     ✓ moe →                                                     
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp1/moe
+                    .csv                                                        
+[14:55:49] INFO     → TP=2  booting vLLM engine                                 
+[14:56:06] INFO     ✓ TP=2  booting vLLM engine (16.7s)                         
+           INFO     TP=2 limits: num_cache_tokens=161408256 max_model_len=40960 
+                    max_num_batched_tokens=2048 max_num_seqs=256 num_experts=128
+                    top_k=8                                                     
+TP=2  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:42 • 0:00:00
+[14:56:48] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp2/den
+                    se.csv                                                      
+TP=2  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:19 • 0:00:00
+[14:57:08] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp2/per
+                    _sequence.csv                                               
+TP=2  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:12:50 • 0:00:00
+[15:09:58] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp2/att
+                    ention.csv                                                  
+[15:10:01] INFO     → TP=4  booting vLLM engine                                 
+[15:10:26] INFO     ✓ TP=4  booting vLLM engine (24.9s)                         
+           INFO     TP=4 limits: num_cache_tokens=324403504 max_model_len=40960 
+                    max_num_batched_tokens=2048 max_num_seqs=256 num_experts=128
+                    top_k=8                                                     
+TP=4  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:42 • 0:00:00
+[15:11:08] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp4/den
+                    se.csv                                                      
+TP=4  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:20 • 0:00:00
+[15:11:28] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp4/per
+                    _sequence.csv                                               
+TP=4  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:13:18 • 0:00:00
+[15:24:46] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp4/att
+                    ention.csv                                                  
+[15:24:50] INFO     → replicating tp_stable layers across TP folders            
+           INFO     ✓ replicating tp_stable layers across TP folders (0.0s)     
+───────────────────────────────────── Done ─────────────────────────────────────
+[15:24:51] INFO     Results written to:                                         
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+FAILED: 2 validation error(s)
+  - missing CSV: /root/LLMServingSim/B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp2/moe.csv
+  - missing CSV: /root/LLMServingSim/B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp4/moe.csv
+finished_at_utc=2026-07-26T15:24:52Z exit_code=1

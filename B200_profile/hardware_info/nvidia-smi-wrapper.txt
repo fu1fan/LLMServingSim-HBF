@@ -1,0 +1,4 @@
+#!/bin/sh
+# TEMP workaround (2026-07-16): GPU7 GSP crashed; stub wedged NVML call so kaalia polling works.
+# Remove this + /usr/local/lib/nvml_gsp_workaround.* after GPU7 reset/reboot.
+exec env LD_PRELOAD=/usr/local/lib/nvml_gsp_workaround.so /usr/bin/nvidia-smi "$@"

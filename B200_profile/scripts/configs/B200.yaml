@@ -1,0 +1,26 @@
+# Metadata-only hardware target for the B200 profiling campaign.
+#
+# LLMServingSim's current profiler does not consume a hardware YAML. The
+# --hardware CLI value is a free-form output label, while GPU/CUDA details are
+# detected at runtime and written to meta.yaml. Keep this file with the
+# delivered profile as the expected-vs-observed hardware checklist.
+schema_version: 1
+consumed_by_profiler: false
+hardware_label: B200
+expected:
+  vendor: NVIDIA
+  product_name_contains: B200
+  hbm_capacity_gb_min: 180
+  hbm_bandwidth_tb_per_s: 8.0
+  exclusive_gpu: true
+  visible_gpu_count: 1
+runtime:
+  gpu_name: null
+  memory_total_mib: null
+  driver_version: null
+  cuda_version: null
+  compute_capability: null
+notes:
+  - Fill runtime fields from the rented server before profiling.
+  - Preserve the full output of nvidia-smi -q under B200_profile/hardware_info.
+  - Select vllm/vllm-openai:v0.19.0-cu130 only when the server uses a CUDA 13.x-compatible driver; otherwise use the repository's v0.19.0 image.
