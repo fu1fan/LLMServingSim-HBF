@@ -123,6 +123,7 @@ class HbfParallelMatrixTests(unittest.TestCase):
         self.assertIn("--expert-routing-profile", command)
         self.assertIn("--no-enable-block-copy", command)
         self.assertIn("--log-level", command)
+        self.assertIn("--cleanup-inputs", command)
         self.assertEqual(
             command[command.index("--expert-routing-policy") + 1],
             "CUSTOM",
