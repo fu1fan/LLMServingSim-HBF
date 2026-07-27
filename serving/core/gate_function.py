@@ -58,6 +58,7 @@ class GateRouter:
         routing_policy="BALANCED",
         seed=42,
         block_copy=True,
+        custom_profile=None,
     ):
         self.instance_id = instance_id
         self.E = int(num_local_experts)
@@ -66,6 +67,21 @@ class GateRouter:
         self.seed = seed
         self.rnd = random.Random(seed) if seed is not None else random
         self.block_copy = bool(block_copy)
+        self.custom_profile = custom_profile
+
+        if self.routing_policy == "CUSTOM":
+            if custom_profile is None:
+                raise ValueError(
+                    "CUSTOM expert routing requires a calibrated routing profile"
+                )
+            if self.block_copy:
+                raise ValueError(
+                    "CUSTOM expert routing requires block_copy=False"
+                )
+        elif custom_profile is not None:
+            raise ValueError(
+                "A custom routing profile may only be used with CUSTOM routing"
+            )
 
         if self.routing_policy == "RR":
             self.routing_fn = self._rr_routing

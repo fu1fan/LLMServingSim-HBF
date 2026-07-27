@@ -24,6 +24,7 @@ from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
 from serving.core.hbf_performance import apply_hbf_latency_scale_override
+from serving.core.expert_routing_profile import validate_expert_routing_options
 from serving.core.hbf_summary import (
     build_hbf_runtime_summary,
     write_json_output,
@@ -236,7 +237,12 @@ def main():
                         'BALANCED (default; analytical pigeonhole approximation of '
                         'a trained load-balanced learned gate), '
                         'RR (round-robin), RAND (uniform random per token), '
-                        'CUSTOM (user-defined)')
+                        'CUSTOM (calibrated profile-driven synthetic routing)')
+    parser.add_argument('--expert-routing-profile', type=str, default=None,
+                        help='versioned JSON routing profile required by '
+                        '--expert-routing-policy=CUSTOM')
+    parser.add_argument('--expert-routing-seed', type=int, default=42,
+                        help='deterministic seed for expert routing (default: 42)')
     parser.add_argument('--enable-block-copy', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Replay one transformer block\'s trace across every '
@@ -305,6 +311,16 @@ def main():
                         'Supports {run_id} placeholder')
 
     args = parser.parse_args()
+
+    validate_expert_routing_options(
+        args.expert_routing_policy,
+        args.expert_routing_profile,
+        args.enable_block_copy,
+    )
+    if args.expert_routing_profile is not None:
+        args.expert_routing_profile = resolve_user_input_path(
+            args.expert_routing_profile
+        )
     
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
@@ -677,7 +693,9 @@ def main():
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        inputs_root=run_paths.inputs_root,
-                                       hbf_mem=inst.get("hbf_mem"))
+                                       hbf_mem=inst.get("hbf_mem"),
+                                       expert_routing_profile=args.expert_routing_profile,
+                                       expert_routing_seed=args.expert_routing_seed)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -746,7 +764,9 @@ def main():
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            inputs_root=run_paths.inputs_root,
-                                           hbf_mem=inst.get("hbf_mem"))
+                                           hbf_mem=inst.get("hbf_mem"),
+                                           expert_routing_profile=args.expert_routing_profile,
+                                           expert_routing_seed=args.expert_routing_seed)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -784,7 +804,9 @@ def main():
                                    ep_rank_offset=instance.get("ep_rank_offset", 0),
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    inputs_root=run_paths.inputs_root,
-                                   hbf_mem=instance.get("hbf_mem"))
+                                   hbf_mem=instance.get("hbf_mem"),
+                                   expert_routing_profile=args.expert_routing_profile,
+                                   expert_routing_seed=args.expert_routing_seed)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],

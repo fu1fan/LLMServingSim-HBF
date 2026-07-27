@@ -6,6 +6,7 @@ import pandas as pd
 import yaml
 from .memory_model import calculate_sizes
 from .gate_function import GateRouter, local_ep_rank_indices
+from .expert_routing_profile import load_expert_routing_profile
 from .config_builder import get_device
 from .hbf_model import is_hbf_location, lower_hbf_trace_location
 from .hbf_performance import (
@@ -1641,7 +1642,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
-                   enable_block_copy=True, inputs_root=None, hbf_mem=None):
+                   enable_block_copy=True, inputs_root=None, hbf_mem=None,
+                   expert_routing_profile=None, expert_routing_seed=42):
 
     model = batch.model
     config = get_config(model)
@@ -1666,12 +1668,25 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     # resolve to a live GateRouter.
     num_experts_cfg = config.get("num_local_experts", config.get("num_experts"))
     if num_experts_cfg:
+        custom_profile = None
+        if expert_routing_policy.upper() == "CUSTOM":
+            if not expert_routing_profile:
+                raise ValueError(
+                    "CUSTOM expert routing requires an expert routing profile"
+                )
+            custom_profile = load_expert_routing_profile(
+                expert_routing_profile,
+                model,
+                num_experts_cfg,
+                config.get('num_experts_per_tok', 1),
+            )
         gate = GateRouter(
             node_id, instance_id, num_experts_cfg,
             num_experts_per_tok=config.get('num_experts_per_tok', 1),
             routing_policy=expert_routing_policy,
-            seed=42,
+            seed=expert_routing_seed,
             block_copy=enable_block_copy,
+            custom_profile=custom_profile,
         )
     else:
         gate = None
