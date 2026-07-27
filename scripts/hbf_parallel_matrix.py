@@ -111,8 +111,7 @@ def _make_spec(
     evidence = [_routing_evidence(manifest, routing_policy)]
     if memory_tier == "hbf":
         evidence.append("hbf-scale-sensitivity")
-    if network_scenario != "central":
-        evidence.append("network-estimated")
+    evidence.append("network-estimated")
     return RunSpec(
         phase=phase,
         model_id=model["id"],
@@ -242,14 +241,48 @@ def _expand_network(manifest):
     return specs
 
 
-def expand_run_specs(manifest, phase):
+def _expand_winners(manifest, selection):
+    if not selection or selection.get("schema_version") != 1:
+        raise ValueError("The winners phase requires a schema v1 selection")
+    models = _model_map(manifest)
+    workloads = _workload_map(manifest)
+    specs = []
+    for row in selection.get("selections", []):
+        model = models[row["model_id"]]
+        topology_map = _topology_map(model)
+        topology_ids = {
+            row["throughput_topology_id"],
+            row["latency_topology_id"],
+        }
+        for topology_id in topology_ids:
+            for scale in manifest["hbf_scales"]:
+                if float(scale) == 1.0:
+                    continue
+                specs.append(
+                    _make_spec(
+                        manifest,
+                        "winners",
+                        model,
+                        topology_map[topology_id],
+                        workloads[row["workload_id"]],
+                        row["routing_policy"],
+                        "hbf",
+                        scale,
+                    )
+                )
+    return specs
+
+
+def expand_run_specs(manifest, phase, selection=None):
     builders = {
         "stage1": _expand_stage1,
         "anchors": _expand_anchors,
         "routing": _expand_routing,
         "network": _expand_network,
     }
-    if phase == "all":
+    if phase == "winners":
+        specs = _expand_winners(manifest, selection)
+    elif phase == "all":
         specs = []
         for name in builders:
             specs.extend(builders[name](manifest))
@@ -393,6 +426,20 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def sha256_tree(path):
+    path = Path(path)
+    digest = hashlib.sha256()
+    for file_path in sorted(
+        candidate for candidate in path.rglob("*")
+        if candidate.is_file()
+    ):
+        relative = file_path.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha256_file(file_path)))
+    return digest.hexdigest()
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -467,13 +514,22 @@ def run_matrix(args):
     if not manifest_path.is_absolute():
         manifest_path = repo_root / manifest_path
     manifest = load_manifest(manifest_path)
-    specs = expand_run_specs(manifest, args.phase)
+    selection = None
+    if args.phase == "winners":
+        if not args.selection:
+            raise ValueError("--phase winners requires --selection")
+        with open(args.selection, "r", encoding="utf-8") as stream:
+            selection = json.load(stream)
+    specs = expand_run_specs(manifest, args.phase, selection)
     if args.limit is not None:
         specs = specs[: args.limit]
 
     output_root = Path(args.output_dir).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     code_sha = _git_sha(repo_root)
+    profile_bundle_sha = sha256_tree(
+        repo_root / manifest["profiles"]["root"]
+    )
     plan_rows = []
     failures = []
 
@@ -525,6 +581,7 @@ def run_matrix(args):
             "status": status,
             "exit_code": completed.returncode,
             "git_sha": code_sha,
+            "profile_bundle_sha256": profile_bundle_sha,
             "spec": asdict(spec),
             "num_devices": spec.num_devices,
             "cluster_config_sha256": sha256_file(cluster_path),
@@ -576,8 +633,12 @@ def build_parser():
     )
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST)
     parser.add_argument("--phase", choices=(
-        "stage1", "anchors", "routing", "network", "all"
+        "stage1", "anchors", "routing", "network", "winners", "all"
     ), default="stage1")
+    parser.add_argument(
+        "--selection",
+        help="Selection JSON emitted by validate_hbf_parallel_results.py",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--dry-run", action="store_true")

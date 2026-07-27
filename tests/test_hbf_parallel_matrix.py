@@ -140,6 +140,30 @@ class HbfParallelMatrixTests(unittest.TestCase):
             {spec.hbf_scale for spec in specs}, {1.0, 4.0, 10.0}
         )
 
+    def test_winner_selection_expands_only_remaining_scales(self):
+        selection = {
+            "schema_version": 1,
+            "selections": [
+                {
+                    "model_id": "qwen235b",
+                    "workload_id": "p2048-g512",
+                    "routing_policy": "CUSTOM",
+                    "device_budget": 8,
+                    "throughput_topology_id": "tp4-ep4-pp2",
+                    "latency_topology_id": "dpg2-tp4-ep8",
+                }
+            ],
+        }
+        specs = matrix.expand_run_specs(
+            self.manifest, "winners", selection
+        )
+        self.assertEqual(len(specs), 14)
+        self.assertEqual(
+            {spec.topology_id for spec in specs},
+            {"tp4-ep4-pp2", "dpg2-tp4-ep8"},
+        )
+        self.assertTrue(all(spec.hbf_scale != 1.0 for spec in specs))
+
 
 if __name__ == "__main__":
     unittest.main()
