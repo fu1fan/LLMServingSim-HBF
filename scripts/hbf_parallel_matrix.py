@@ -373,8 +373,13 @@ def _network_values(manifest, spec, num_nodes):
     topology = spec.topology
     dp_group = topology.get("dp_group_size")
     replicas = int(topology.get("replicas", 1))
+    tp = int(topology["tp"])
     pp = int(topology["pp"])
-    num_dims = 2 if dp_group is not None or replicas * pp > 1 else 1
+    if dp_group is not None:
+        num_dims = 2
+    else:
+        second_dim = replicas if tp == 1 else replicas * pp
+        num_dims = 2 if second_dim > 1 else 1
     if num_dims == 1:
         return (
             scenario["intra_bw_gb_s"],

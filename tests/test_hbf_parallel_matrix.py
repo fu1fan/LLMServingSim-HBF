@@ -104,6 +104,20 @@ class HbfParallelMatrixTests(unittest.TestCase):
         self.assertEqual(cluster["link_bw"], [1800, 50])
         self.assertEqual(cluster["link_latency"], [500, 10000])
 
+    def test_pure_pipeline_parallelism_uses_one_network_dimension(self):
+        spec = next(
+            spec
+            for spec in matrix.expand_run_specs(
+                self.manifest, "stage1"
+            )
+            if spec.model_id == "llama405b"
+            and spec.topology_id == "pp8"
+            and spec.memory_tier == "hbf"
+        )
+        cluster = matrix.build_cluster_config(self.manifest, spec)
+        self.assertEqual(cluster["link_bw"], 1800)
+        self.assertEqual(cluster["link_latency"], 500)
+
     def test_custom_command_is_explicit_and_disables_block_copy(self):
         spec = next(
             spec
