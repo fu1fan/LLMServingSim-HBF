@@ -1,7 +1,9 @@
 import importlib.util
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -163,6 +165,63 @@ class HbfParallelMatrixTests(unittest.TestCase):
             {"tp4-ep4-pp2", "dpg2-tp4-ep8"},
         )
         self.assertTrue(all(spec.hbf_scale != 1.0 for spec in specs))
+
+    def test_parallel_runner_executes_each_spec_once(self):
+        base = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        specs = [
+            replace(base, workload_id=f"workload-{index}")
+            for index in range(4)
+        ]
+        calls = []
+
+        def fake_run_one(_repo_root, _manifest, spec, *_args):
+            calls.append(spec.run_id)
+            return spec.run_id, "completed", 0
+
+        run_args = [
+            (spec, Path("/tmp") / spec.run_id, ["python"], "sha",
+             "profile-sha", False)
+            for spec in specs
+        ]
+        with patch.object(matrix, "_run_one", side_effect=fake_run_one):
+            failures = matrix._run_specs(
+                REPO_ROOT,
+                self.manifest,
+                jobs=3,
+                keep_going=True,
+                run_args=run_args,
+            )
+        self.assertEqual(failures, [])
+        self.assertCountEqual(calls, [spec.run_id for spec in specs])
+
+    def test_parallel_runner_stops_submitting_after_failure(self):
+        base = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        specs = [
+            replace(base, workload_id=f"workload-{index}")
+            for index in range(5)
+        ]
+        calls = []
+
+        def fake_run_one(_repo_root, _manifest, spec, *_args):
+            calls.append(spec.run_id)
+            status = "failed" if spec == specs[0] else "completed"
+            return spec.run_id, status, int(status == "failed")
+
+        run_args = [
+            (spec, Path("/tmp") / spec.run_id, ["python"], "sha",
+             "profile-sha", False)
+            for spec in specs
+        ]
+        with patch.object(matrix, "_run_one", side_effect=fake_run_one):
+            failures = matrix._run_specs(
+                REPO_ROOT,
+                self.manifest,
+                jobs=2,
+                keep_going=False,
+                run_args=run_args,
+            )
+        self.assertEqual(failures, [specs[0].run_id])
+        self.assertLessEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

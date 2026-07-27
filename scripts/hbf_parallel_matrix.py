@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -508,6 +509,119 @@ def _git_sha(repo_root):
     ).strip()
 
 
+def _positive_int(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _run_one(repo_root, manifest, spec, run_dir, command,
+             code_sha, profile_bundle_sha, rerun_failed):
+    previous_manifest = run_dir / "manifest.json"
+    if previous_manifest.is_file() and not rerun_failed:
+        previous = json.loads(
+            previous_manifest.read_text(encoding="utf-8")
+        )
+        if previous.get("status") == "completed":
+            return spec.run_id, "skipped", 0
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cluster_path = run_dir / "cluster.json"
+    write_json(cluster_path, build_cluster_config(manifest, spec))
+    log_path = run_dir / "simulator.log"
+    print(f"[run] {spec.run_id}", flush=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    status = "completed" if completed.returncode == 0 else "failed"
+    run_manifest = {
+        "schema_version": 1,
+        "experiment_id": manifest["experiment_id"],
+        "run_id": spec.run_id,
+        "status": status,
+        "exit_code": completed.returncode,
+        "git_sha": code_sha,
+        "profile_bundle_sha256": profile_bundle_sha,
+        "spec": asdict(spec),
+        "num_devices": spec.num_devices,
+        "cluster_config_sha256": sha256_file(cluster_path),
+        "workload_sha256": sha256_file(
+            repo_root / spec.workload_path
+        ),
+        "routing_profile_sha256": (
+            sha256_file(
+                repo_root / manifest["routing"]["custom_profile"]
+            )
+            if spec.routing_policy == "CUSTOM"
+            else None
+        ),
+        "command": command,
+        "outputs": {
+            "requests": os.fspath(run_dir / "requests.csv"),
+            "runtime": os.fspath(run_dir / "runtime.json"),
+            "log": os.fspath(log_path),
+        },
+    }
+    write_json(previous_manifest, run_manifest)
+    return spec.run_id, status, completed.returncode
+
+
+def _run_specs(repo_root, manifest, jobs, keep_going, run_args):
+    failures = []
+    if jobs == 1:
+        for args in run_args:
+            run_id, status, _ = _run_one(
+                repo_root, manifest, *args
+            )
+            print(f"[{status}] {run_id}", flush=True)
+            if status == "failed":
+                failures.append(run_id)
+                if not keep_going:
+                    break
+        return failures
+
+    pending_args = iter(run_args)
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        in_flight = {}
+
+        def submit_next():
+            try:
+                args = next(pending_args)
+            except StopIteration:
+                return False
+            future = executor.submit(
+                _run_one, repo_root, manifest, *args
+            )
+            in_flight[future] = args[0].run_id
+            return True
+
+        for _ in range(jobs):
+            if not submit_next():
+                break
+
+        stop_submitting = False
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                in_flight.pop(future)
+                run_id, status, _ = future.result()
+                print(f"[{status}] {run_id}", flush=True)
+                if status == "failed":
+                    failures.append(run_id)
+                    if not keep_going:
+                        stop_submitting = True
+            if not stop_submitting:
+                for _ in done:
+                    submit_next()
+    return failures
+
+
 def run_matrix(args):
     repo_root = Path(__file__).resolve().parents[1]
     manifest_path = Path(args.manifest)
@@ -531,11 +645,10 @@ def run_matrix(args):
         repo_root / manifest["profiles"]["root"]
     )
     plan_rows = []
-    failures = []
+    run_args = []
 
     for spec in specs:
         run_dir = output_root / spec.run_id
-        cluster = build_cluster_config(manifest, spec)
         command = build_command(
             repo_root, manifest, spec, run_dir, args.python
         )
@@ -550,63 +663,24 @@ def run_matrix(args):
         )
         if args.dry_run:
             continue
+        run_args.append((
+            spec,
+            run_dir,
+            command,
+            code_sha,
+            profile_bundle_sha,
+            args.rerun_failed,
+        ))
 
-        previous_manifest = run_dir / "manifest.json"
-        if previous_manifest.is_file() and not args.rerun_failed:
-            previous = json.loads(
-                previous_manifest.read_text(encoding="utf-8")
-            )
-            if previous.get("status") == "completed":
-                print(f"[skip] {spec.run_id}", flush=True)
-                continue
-
-        run_dir.mkdir(parents=True, exist_ok=True)
-        cluster_path = run_dir / "cluster.json"
-        write_json(cluster_path, cluster)
-        log_path = run_dir / "simulator.log"
-        print(f"[run] {spec.run_id}", flush=True)
-        with log_path.open("w", encoding="utf-8") as log:
-            completed = subprocess.run(
-                command,
-                cwd=repo_root,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        status = "completed" if completed.returncode == 0 else "failed"
-        run_manifest = {
-            "schema_version": 1,
-            "experiment_id": manifest["experiment_id"],
-            "run_id": spec.run_id,
-            "status": status,
-            "exit_code": completed.returncode,
-            "git_sha": code_sha,
-            "profile_bundle_sha256": profile_bundle_sha,
-            "spec": asdict(spec),
-            "num_devices": spec.num_devices,
-            "cluster_config_sha256": sha256_file(cluster_path),
-            "workload_sha256": sha256_file(
-                repo_root / spec.workload_path
-            ),
-            "routing_profile_sha256": (
-                sha256_file(
-                    repo_root / manifest["routing"]["custom_profile"]
-                )
-                if spec.routing_policy == "CUSTOM"
-                else None
-            ),
-            "command": command,
-            "outputs": {
-                "requests": os.fspath(run_dir / "requests.csv"),
-                "runtime": os.fspath(run_dir / "runtime.json"),
-                "log": os.fspath(log_path),
-            },
-        }
-        write_json(previous_manifest, run_manifest)
-        if completed.returncode != 0:
-            failures.append(spec.run_id)
-            if not args.keep_going:
-                break
+    failures = []
+    if not args.dry_run:
+        failures = _run_specs(
+            repo_root,
+            manifest,
+            args.jobs,
+            args.keep_going,
+            run_args,
+        )
 
     write_json(
         output_root / "plan.json",
@@ -643,6 +717,12 @@ def build_parser():
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=1,
+        help="number of simulator subprocesses to run concurrently",
+    )
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--rerun-failed", action="store_true")
     return parser
