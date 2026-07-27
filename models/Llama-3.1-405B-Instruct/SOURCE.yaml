@@ -1,0 +1,20 @@
+model_id: meta-llama/Llama-3.1-405B-Instruct
+official_huggingface_access: gated
+official_files_http_status: 401
+prepared_from:
+  repository: nvidia/Llama-3.1-405B-Instruct-FP8
+  revision: b2cbce00b6238d2fe04939ee8c9851c78ac83046
+  files:
+    - config.json
+    - tokenizer_config.json
+    - generation_config.json
+profile_use:
+  config_json: true
+  tokenizer_config_json: false
+  generation_config_json: false
+verification:
+  status: pending_official_gated_comparison
+  requirement_before_gpu_profile: compare config.json with the current official Meta file using an approved HF_TOKEN
+notes:
+  - The public source config declares LlamaForCausalLM, BF16, 126 layers, hidden size 16384, 128 attention heads, 8 KV heads, and 131072 positions.
+  - LLMServingSim uses load_format=dummy and skip_tokenizer_init, so no checkpoint weights or tokenizer assets are required by the profiler.

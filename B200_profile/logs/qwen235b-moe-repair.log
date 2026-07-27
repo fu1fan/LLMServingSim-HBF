@@ -1,0 +1,39 @@
+started_at_utc=2026-07-26T15:26:36Z
+[15:26:40] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/Qwen/Qwen3-235B-A22B.json 
+                    (model_type=qwen3_moe → architecture=qwen3_moe)             
+────────────── Profiling Qwen/Qwen3-235B-A22B on B200 (qwen3_moe) ──────────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4]                                       
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+           INFO     Slice refresh: tp=2 group=moe                               
+           INFO     → TP=2  booting vLLM engine                                 
+[15:26:53] INFO     ✓ TP=2  booting vLLM engine (12.4s)                         
+TP=2  moe ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 50/50 0:00:13 • 0:00:00
+[15:27:07] INFO     ✓ moe →                                                     
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp2/moe
+                    .csv                                                        
+───────────────────────────────────── Done ─────────────────────────────────────
+[15:27:08] INFO     Results written to:                                         
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+[15:27:13] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/Qwen/Qwen3-235B-A22B.json 
+                    (model_type=qwen3_moe → architecture=qwen3_moe)             
+────────────── Profiling Qwen/Qwen3-235B-A22B on B200 (qwen3_moe) ──────────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4]                                       
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+           INFO     Slice refresh: tp=4 group=moe                               
+           INFO     → TP=4  booting vLLM engine                                 
+[15:27:34] INFO     ✓ TP=4  booting vLLM engine (20.8s)                         
+TP=4  moe ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 50/50 0:00:14 • 0:00:00
+[15:27:48] INFO     ✓ moe →                                                     
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp4/moe
+                    .csv                                                        
+───────────────────────────────────── Done ─────────────────────────────────────
+[15:27:49] INFO     Results written to:                                         
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+PASS: /root/LLMServingSim/B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16 contains 12 valid CSV files, complete TP coverage [1, 2, 4], and matching meta.yaml.
+finished_at_utc=2026-07-26T15:27:50Z exit_code=0

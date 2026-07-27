@@ -1,0 +1,22 @@
+verification_scope=profiling architecture metadata
+verified_at_utc=2026-07-26T13:23:00Z
+result=accepted_for_dummy-weight LLMServingSim profiling
+
+Meta primary source:
+https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md
+- Confirms Llama 3.1 405B, 128K context, and grouped-query attention.
+
+Public config cross-checks:
+https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8/blob/b2cbce00b6238d2fe04939ee8c9851c78ac83046/config.json
+https://huggingface.co/mlx-community/Meta-Llama-3.1-405B-Instruct-8bit/blob/main/config.json
+https://huggingface.co/amd/Llama-3.1-405B-Instruct-FP8-KV/blob/main/config.json
+- Agree on hidden_size=16384, intermediate_size=53248, num_hidden_layers=126,
+  num_attention_heads=128, num_key_value_heads=8, vocab_size=128256,
+  max_position_embeddings=131072, Llama 3 rope scaling, and BF16 base dtype.
+
+Local config sha256:
+26f6d8134a435093c72a8ca0e3932a9cb40f4244ca8a6642c2322391233fda29
+
+The gated Meta Hugging Face files were not accessed. This verification is
+limited to the architecture fields used by LLMServingSim's load_format=dummy
+profiler; no checkpoint weights or tokenizer execution are involved.

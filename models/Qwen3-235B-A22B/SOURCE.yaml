@@ -1,0 +1,18 @@
+model_id: Qwen/Qwen3-235B-A22B
+official_huggingface_access: public
+prepared_from:
+  repository: Qwen/Qwen3-235B-A22B
+  revision: 04127485f4b84439c34689fdee54a616531bf00d
+  files:
+    - config.json
+    - tokenizer_config.json
+    - generation_config.json
+profile_use:
+  config_json: true
+  tokenizer_config_json: false
+  generation_config_json: false
+verification:
+  status: prepared_from_official_public_revision
+notes:
+  - The config declares Qwen3MoeForCausalLM, BF16, 94 layers, 128 experts, and top-8 routing.
+  - LLMServingSim uses load_format=dummy and skip_tokenizer_init, so no checkpoint weights or tokenizer assets are required by the profiler.

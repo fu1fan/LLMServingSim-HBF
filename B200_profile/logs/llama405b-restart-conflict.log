@@ -1,0 +1,214 @@
+started_at_utc=2026-07-26T13:59:47Z
+pandas=2.3.3 torch=2.10.0+cu130 torch_cuda=13.0 vllm=0.19.0 gpu=NVIDIA B200
+[13:59:53] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/meta-llama/Llama-3.1-405B-
+                    Instruct.json (model_type=llama → architecture=llama)       
+───────── Profiling meta-llama/Llama-3.1-405B-Instruct on B200 (llama) ─────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4, 8]                                    
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16                                                      
+           INFO     → TP=1  booting vLLM engine                                 
+[13:59:55] ERROR    Captured vLLM stdio before failure:                         
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55  EngineCore      
+                    failed to start.                                            
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55  Traceback (most 
+                    recent call last):                                          
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 1082, in run_engine_core                         
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55      engine_core 
+                    = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)     
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.p
+                    y", line 178, in sync_wrapper                               
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55      return      
+                    func(*args, **kwargs)                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 848, in __init__                                 
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    super().__init__(                                           
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 114, in __init__                                 
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    self.model_executor = executor_class(vllm_config)           
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^                                 
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.p
+                    y", line 178, in sync_wrapper                               
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55      return      
+                    func(*args, **kwargs)                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/ab
+                    stract.py", line 103, in __init__                           
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    self._init_executor()                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/un
+                    iproc_executor.py", line 47, in _init_executor              
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    self.driver_worker.init_device()                            
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/work
+                    er_base.py", line 312, in init_device                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    self.worker.init_device()  # type: ignore                   
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^                                   
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.p
+                    y", line 178, in sync_wrapper                               
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55      return      
+                    func(*args, **kwargs)                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^                                       
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_
+                    worker.py", line 283, in init_device                        
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    self.requested_memory = request_memory(init_snapshot,       
+                    self.cache_config)                                          
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55                  
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^            
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55    File          
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/util
+                    s.py", line 413, in request_memory                          
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55      raise       
+                    ValueError(                                                 
+                    (EngineCore pid=3237) ERROR 07-26 13:59:55  ValueError: Free
+                    memory on device cuda:0 (14.72/178.34 GiB) on startup is    
+                    less than desired GPU memory utilization (0.9, 160.51 GiB). 
+                    Decrease GPU memory utilization or reduce GPU memory used by
+                    other processes.                                            
+                    (EngineCore pid=3237) Process EngineCore:                   
+                    (EngineCore pid=3237) Traceback (most recent call last):    
+                    (EngineCore pid=3237)   File                                
+                    "/usr/lib/python3.12/multiprocessing/process.py", line 314, 
+                    in _bootstrap                                               
+                    (EngineCore pid=3237)     self.run()                        
+                    (EngineCore pid=3237)   File                                
+                    "/usr/lib/python3.12/multiprocessing/process.py", line 108, 
+                    in run                                                      
+                    (EngineCore pid=3237)     self._target(*self._args,         
+                    **self._kwargs)                                             
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 1112, in run_engine_core                         
+                    (EngineCore pid=3237)     raise e                           
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 1082, in run_engine_core                         
+                    (EngineCore pid=3237)     engine_core =                     
+                    EngineCoreProc(*args, engine_index=dp_rank, **kwargs)       
+                    (EngineCore pid=3237)                                       
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^       
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.p
+                    y", line 178, in sync_wrapper                               
+                    (EngineCore pid=3237)     return func(*args, **kwargs)      
+                    (EngineCore pid=3237)            ^^^^^^^^^^^^^^^^^^^^^      
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 848, in __init__                                 
+                    (EngineCore pid=3237)     super().__init__(                 
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core
+                    .py", line 114, in __init__                                 
+                    (EngineCore pid=3237)     self.model_executor =             
+                    executor_class(vllm_config)                                 
+                    (EngineCore pid=3237)                                       
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^                                 
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.p
+                    y", line 178, in sync_wrapper                               
+                    (EngineCore pid=3237)     return func(*args, **kwargs)      
+                    (EngineCore pid=3237)            ^^^^^^^^^^^^^^^^^^^^^      
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/ab
+                    stract.py", line 103, in __init__                           
+                    (EngineCore pid=3237)     self._init_executor()             
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/un
+                    iproc_executor.py", line 47, in _init_executor              
+                    (EngineCore pid=3237)     self.driver_worker.init_device()  
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/work
+                    er_base.py", line 312, in init_device                       
+                    (EngineCore pid=3237)     self.worker.init_device()  # type:
+                    ignore                                                      
+                    (EngineCore pid=3237)     ^^^^^^^^^^^^^^^^^^^^^^^^^         
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.p
+                    y", line 178, in sync_wrapper                               
+                    (EngineCore pid=3237)     return func(*args, **kwargs)      
+                    (EngineCore pid=3237)            ^^^^^^^^^^^^^^^^^^^^^      
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_
+                    worker.py", line 283, in init_device                        
+                    (EngineCore pid=3237)     self.requested_memory =           
+                    request_memory(init_snapshot, self.cache_config)            
+                    (EngineCore pid=3237)                                       
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^            
+                    (EngineCore pid=3237)   File                                
+                    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/util
+                    s.py", line 413, in request_memory                          
+                    (EngineCore pid=3237)     raise ValueError(                 
+                    (EngineCore pid=3237) ValueError: Free memory on device     
+                    cuda:0 (14.72/178.34 GiB) on startup is less than desired   
+                    GPU memory utilization (0.9, 160.51 GiB). Decrease GPU      
+                    memory utilization or reduce GPU memory used by other       
+                    processes.                                                  
+                                                                                
+           ERROR    ✗ TP=1  booting vLLM engine (failed after 1.7s)             
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/root/LLMServingSim/profiler/__main__.py", line 435, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/root/LLMServingSim/profiler/__main__.py", line 419, in main
+    run_full(arch_path, profile_args, ns.out_root)
+  File "/root/LLMServingSim/profiler/core/runner.py", line 172, in run_full
+    llm, engine_kwargs, tmpdir = spin_up(args, tp)
+                                 ^^^^^^^^^^^^^^^^^
+  File "/root/LLMServingSim/profiler/core/engine.py", line 242, in spin_up
+    llm = LLM(**kwargs)
+          ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/llm.py", line 382, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/llm_engine.py", line 177, in from_engine_args
+    return cls(
+           ^^^^
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/llm_engine.py", line 111, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py", line 101, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py", line 710, in __init__
+    super().__init__(
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py", line 535, in __init__
+    with launch_core_engines(
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/utils.py", line 998, in launch_core_engines
+    wait_for_engine_startup(
+  File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/utils.py", line 1057, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+finished_at_utc=2026-07-26T13:59:56Z exit_code=1

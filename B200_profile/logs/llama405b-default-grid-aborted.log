@@ -1,0 +1,24 @@
+started_at_utc=2026-07-26T13:32:24Z
+pandas=2.3.3 torch=2.10.0+cu130 torch_cuda=13.0 vllm=0.19.0 gpu=NVIDIA B200
+[13:32:31] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/meta-llama/Llama-3.1-405B-
+                    Instruct.json (model_type=llama → architecture=llama)       
+───────── Profiling meta-llama/Llama-3.1-405B-Instruct on B200 (llama) ─────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4, 8]                                    
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16                                                      
+           INFO     → TP=1  booting vLLM engine                                 
+[13:32:47] INFO     ✓ TP=1  booting vLLM engine (16.2s)                         
+           INFO     TP=1 limits: num_cache_tokens=38179744 max_model_len=131072 
+                    max_num_batched_tokens=2048 max_num_seqs=256                
+TP=1  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:23 • 0:00:00
+[13:33:11] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp1/dense.csv                                        
+TP=1  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:15 • 0:00:00
+[13:33:26] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp1/per_sequence.csv                                 
+aborted_for_cost_optimization_at_utc=2026-07-26T13:59:47Z

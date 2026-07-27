@@ -1,0 +1,84 @@
+started_at_utc=2026-07-26T14:00:58Z
+pandas=2.3.3 torch=2.10.0+cu130 torch_cuda=13.0 vllm=0.19.0 gpu=NVIDIA B200
+[14:01:04] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/meta-llama/Llama-3.1-405B-
+                    Instruct.json (model_type=llama → architecture=llama)       
+───────── Profiling meta-llama/Llama-3.1-405B-Instruct on B200 (llama) ─────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4, 8]                                    
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16                                                      
+           INFO     → TP=1  booting vLLM engine                                 
+[14:01:10] INFO     ✓ TP=1  booting vLLM engine (5.8s)                          
+           INFO     TP=1 limits: num_cache_tokens=38179744 max_model_len=131072 
+                    max_num_batched_tokens=2048 max_num_seqs=256                
+           INFO     dense resume: 1368 prior rows preloaded, 152 prior shot keys
+                    recognized                                                  
+           INFO     dense: skipping 152 already-measured shots, firing 0 new    
+           INFO     dense: nothing to do (all shots already measured)           
+           INFO     per_sequence resume: 80 prior rows preloaded, 40 prior shot 
+                    keys recognized                                             
+           INFO     per_sequence: skipping 40 already-measured shots, firing 0  
+                    new                                                         
+           INFO     per_sequence: nothing to do (all shots already measured)    
+TP=1  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:08:53 • 0:00:00
+[14:10:03] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp1/attention.csv                                    
+[14:10:05] INFO     → TP=2  booting vLLM engine                                 
+[14:10:17] INFO     ✓ TP=2  booting vLLM engine (12.1s)                         
+           INFO     TP=2 limits: num_cache_tokens=80147280 max_model_len=131072 
+                    max_num_batched_tokens=2048 max_num_seqs=256                
+TP=2  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:22 • 0:00:00
+[14:10:39] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp2/dense.csv                                        
+TP=2  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:15 • 0:00:00
+[14:10:54] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp2/per_sequence.csv                                 
+TP=2  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:09:15 • 0:00:00
+[14:20:10] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp2/attention.csv                                    
+[14:20:12] INFO     → TP=4  booting vLLM engine                                 
+[14:20:29] INFO     ✓ TP=4  booting vLLM engine (17.2s)                         
+           INFO     TP=4 limits: num_cache_tokens=164082848 max_model_len=131072
+                    max_num_batched_tokens=2048 max_num_seqs=256                
+TP=4  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:21 • 0:00:00
+[14:20:51] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp4/dense.csv                                        
+TP=4  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:15 • 0:00:00
+[14:21:07] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp4/per_sequence.csv                                 
+TP=4  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:09:33 • 0:00:00
+[14:30:40] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp4/attention.csv                                    
+[14:30:43] INFO     → TP=8  booting vLLM engine                                 
+[14:31:08] INFO     ✓ TP=8  booting vLLM engine (25.2s)                         
+           INFO     TP=8 limits: num_cache_tokens=331922752 max_model_len=131072
+                    max_num_batched_tokens=2048 max_num_seqs=256                
+TP=8  dense ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152/152 0:00:22 • 0:00:00
+[14:31:30] INFO     ✓ dense →                                                   
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp8/dense.csv                                        
+TP=8  per_sequence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40/40 0:00:14 • 0:00:00
+[14:31:45] INFO     ✓ per_sequence →                                            
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp8/per_sequence.csv                                 
+TP=8  attention ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1769/1769 0:09:12 • 0:00:00
+[14:40:58] INFO     ✓ attention →                                               
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16/tp8/attention.csv                                    
+[14:41:02] INFO     → replicating tp_stable layers across TP folders            
+           INFO     ✓ replicating tp_stable layers across TP folders (0.0s)     
+───────────────────────────────────── Done ─────────────────────────────────────
+           INFO     Results written to:                                         
+                    B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruc
+                    t/bf16                                                      
+PASS: /root/LLMServingSim/B200_profile/profiles/B200/meta-llama/Llama-3.1-405B-Instruct/bf16 contains 12 valid CSV files, complete TP coverage [1, 2, 4, 8], and matching meta.yaml.
+finished_at_utc=2026-07-26T14:41:03Z exit_code=0

@@ -1,0 +1,54 @@
+started_at_utc=2026-07-26T15:28:22Z
+hard_runtime_limit=60m; grid_factors=8.0
+[15:28:26] INFO     Model config:                                               
+                    /root/LLMServingSim/configs/model/Qwen/Qwen3-235B-A22B.json 
+                    (model_type=qwen3_moe → architecture=qwen3_moe)             
+────────────── Profiling Qwen/Qwen3-235B-A22B on B200 (qwen3_moe) ──────────────
+           INFO     Variant: bf16                                               
+           INFO     TP degrees: [1, 2, 4]                                       
+           INFO     Output root:                                                
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16        
+           INFO     → TP=1  booting vLLM engine                                 
+[15:28:34] INFO     ✓ TP=1  booting vLLM engine (8.6s)                          
+           INFO     TP=1 limits: num_cache_tokens=79906496 max_model_len=40960  
+                    max_num_batched_tokens=2048 max_num_seqs=256 num_experts=128
+                    top_k=8                                                     
+           INFO     only_skew mode: skipping dense / per_seq / attention / moe  
+                    categories                                                  
+[15:28:35] INFO     skew grid: n=2-256 x8 ratio=[0.0625, 0.125, 0.25, 0.5, 0.75,
+                    0.9] pc=0, 16-2048 x8 kp=0, 512-8192 x8 kvs=128-16384 x8    
+                    skew=(T1=4.0, T2 swept)                                     
+TP=1  skew ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 645/645 0:19:48 • 0:00:00
+[15:48:23] INFO     mixed: n=586 alpha mean=-21661335164.091                    
+                    min=-12455267719445.000 max=8.287                           
+           INFO     pure: n=59 alpha mean=0.235 min=-0.007 max=1.056            
+           INFO     ✓ skew →                                                    
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp1/ske
+                    w.csv                                                       
+[15:48:25] INFO     → TP=2  booting vLLM engine                                 
+[15:48:36] INFO     ✓ TP=2  booting vLLM engine (11.0s)                         
+           INFO     TP=2 limits: num_cache_tokens=161408256 max_model_len=40960 
+                    max_num_batched_tokens=2048 max_num_seqs=256 num_experts=128
+                    top_k=8                                                     
+           INFO     only_skew mode: skipping dense / per_seq / attention / moe  
+                    categories                                                  
+           INFO     skew grid: n=2-256 x8 ratio=[0.0625, 0.125, 0.25, 0.5, 0.75,
+                    0.9] pc=0, 16-2048 x8 kp=0, 512-8192 x8 kvs=128-16384 x8    
+                    skew=(T1=4.0, T2 swept)                                     
+TP=2  skew ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 645/645 0:20:03 • 0:00:00
+[16:08:39] INFO     mixed: n=586 alpha mean=-0.038 min=-223.000 max=17.753      
+           INFO     pure: n=59 alpha mean=0.333 min=-0.011 max=1.230            
+           INFO     ✓ skew →                                                    
+                    B200_profile/profiles/B200/Qwen/Qwen3-235B-A22B/bf16/tp2/ske
+                    w.csv                                                       
+[16:08:42] INFO     → TP=4  booting vLLM engine                                 
+[16:09:01] INFO     ✓ TP=4  booting vLLM engine (19.0s)                         
+           INFO     TP=4 limits: num_cache_tokens=324403504 max_model_len=40960 
+                    max_num_batched_tokens=2048 max_num_seqs=256 num_experts=128
+                    top_k=8                                                     
+           INFO     only_skew mode: skipping dense / per_seq / attention / moe  
+                    categories                                                  
+           INFO     skew grid: n=2-256 x8 ratio=[0.0625, 0.125, 0.25, 0.5, 0.75,
+                    0.9] pc=0, 16-2048 x8 kp=0, 512-8192 x8 kvs=128-16384 x8    
+                    skew=(T1=4.0, T2 swept)                                     
+finished_at_utc=2026-07-26T16:28:27Z exit_code=124

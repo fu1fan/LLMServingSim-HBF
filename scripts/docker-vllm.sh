@@ -14,13 +14,15 @@
 # can be run via ``python -m profiler``, ``python -m bench``, etc.
 #
 # The official vllm/vllm-openai image already provides vllm, pydantic,
-# pyyaml, rich, and huggingface_hub — no extra pip installs required.
+# pyyaml, rich, and huggingface_hub. The current profiler also imports
+# pandas while writing skew-fit metadata, including skip-skew runs.
 
 set -euo pipefail
 
 # Resolve the repo root regardless of where this script is invoked from.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"                    # .../LLMServingSim
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.19.0}"
 
 docker run --name vllm_docker \
   --gpus all \
@@ -31,5 +33,5 @@ docker run --name vllm_docker \
   --shm-size=16g \
   -w /workspace \
   --entrypoint /bin/bash \
-  vllm/vllm-openai:v0.19.0 \
-  -c "pip install datasets matplotlib && exec bash"
+  "$VLLM_IMAGE" \
+  -c "pip install 'pandas>=2.2,<3' datasets matplotlib && exec bash"
