@@ -167,10 +167,12 @@ def _resolve_dp_groups(all_instances):
             # EP spans both dimensions (cross-instance ALLTOALL)
             ep_dim = [True, True] if tp0 > 1 else [False, True]
 
-        for m in members:
+        for group_rank, m in enumerate(members):
             m["dp_group_size"] = dp_size
+            m["dp_group_rank"] = group_rank
             m["local_ep"] = local_ep
             m["ep_total"] = ep_total
+            m["ep_rank_offset"] = group_rank * local_ep
             m["tp_dim"] = tp_dim
             m["ep_dim"] = ep_dim
 
@@ -185,8 +187,10 @@ def _resolve_dp_groups(all_instances):
     for inst in all_instances:
         if inst.get("dp_group") is None:
             inst["dp_group_size"] = 1
+            inst["dp_group_rank"] = 0
             inst["local_ep"] = inst["ep_size"]
             inst["ep_total"] = inst["ep_size"]
+            inst["ep_rank_offset"] = 0
             inst["tp_dim"] = local_dim
             inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
 

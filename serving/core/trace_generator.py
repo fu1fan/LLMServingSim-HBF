@@ -5,7 +5,7 @@ from .utils import *
 import pandas as pd
 import yaml
 from .memory_model import calculate_sizes
-from .gate_function import GateRouter
+from .gate_function import GateRouter, local_ep_rank_indices
 from .config_builder import get_device
 from .hbf_model import is_hbf_location, lower_hbf_trace_location
 from .hbf_performance import (
@@ -113,6 +113,7 @@ class TraceCtx:
     pp_size: int       # pipeline parallel degree
     local_ep: int      # expert parallel degree within this instance
     ep_total: int      # total EP degree across DP group
+    ep_rank_offset: int  # first global EP rank owned by this instance
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
@@ -861,7 +862,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                     tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
                      hbf_mem=None):
     model_type = config.get('model_type')
     if not model_type:
@@ -901,6 +902,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         n_head=n_head, kv_head=kv_head, head_dim=head_dim, is_moe=is_moe,
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
+        ep_rank_offset=ep_rank_offset,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
         hbf_performance_source=hbf_performance_source,
     )
@@ -1185,14 +1187,18 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # Each local GPU handles exactly one EP rank. The routing result already
     # accounts for cross-instance token redistribution (ALLTOALL), so
     # local_tokens[rank] reflects the post-dispatch workload for that rank.
-    emit_ep = max(ctx.local_ep, 1)
+    global_ep_ranks = local_ep_rank_indices(
+        ctx.local_ep,
+        ctx.ep_total,
+        ctx.ep_rank_offset,
+    )
     max_rank_latency_ns = 0
 
     # Pre-expert AllGather power (dispatch)
     if power_acc is not None and ep_total > 1:
         power_acc.link_data_bytes += total_ring_data(dispatch_comm_size, ep_total, collective="allgather")
 
-    for i in range(emit_ep):
+    for i, global_ep_rank in enumerate(global_ep_ranks):
         if i == 0:
             lines.append(f"EXPERT {i} {dispatch_comm_type} {dispatch_comm_size}\n")
         else:
@@ -1201,8 +1207,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         # ``local_tokens`` here is the per-rank workload after dispatch
         # — already scaled to this rank's real tokens (no DP-padding sum).
         # We feed it straight into the MoE profile lookup.
-        local_tokens = routing.local_tokens[i]
-        activated_experts = routing.activated_experts[i]
+        local_tokens = routing.local_tokens[global_ep_rank]
+        activated_experts = routing.activated_experts[global_ep_rank]
 
         if local_tokens > 0:
             rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
@@ -1472,7 +1478,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                      tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
                       hbf_mem=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
@@ -1480,6 +1486,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim,
+                           ep_rank_offset=ep_rank_offset,
                            dp_sum_total_len=dp_sum_total_len,
                            hbf_mem=hbf_mem)
     bctx = _build_batch_ctx(batch, ctx)
@@ -1528,7 +1535,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                                  tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
                                   hbf_mem=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
@@ -1536,6 +1543,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim,
+                           ep_rank_offset=ep_rank_offset,
                            dp_sum_total_len=dp_sum_total_len,
                            hbf_mem=hbf_mem)
     bctx1 = _build_batch_ctx(batches[0], ctx)
@@ -1632,7 +1640,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                   tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
                    enable_block_copy=True, inputs_root=None, hbf_mem=None):
 
     model = batch.model
@@ -1685,6 +1693,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim,
+                        ep_rank_offset=ep_rank_offset,
                         dp_sum_total_len=dp_sum_total_len,
                         hbf_mem=hbf_mem)
     if not enable_sub_batch_interleaving:

@@ -673,6 +673,7 @@ def main():
                                        inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                        dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                       ep_rank_offset=inst.get("ep_rank_offset", 0),
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        inputs_root=run_paths.inputs_root,
@@ -741,6 +742,7 @@ def main():
                                            inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                            dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                           ep_rank_offset=inst.get("ep_rank_offset", 0),
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            inputs_root=run_paths.inputs_root,
@@ -779,6 +781,7 @@ def main():
                                    inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
+                                   ep_rank_offset=instance.get("ep_rank_offset", 0),
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    inputs_root=run_paths.inputs_root,
                                    hbf_mem=instance.get("hbf_mem"))

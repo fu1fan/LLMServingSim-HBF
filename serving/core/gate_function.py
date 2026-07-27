@@ -11,6 +11,18 @@ class RoutingResult:
     source_tokens: list    # [rank] -> token count originating from this rank before dispatch
 
 
+def local_ep_rank_indices(local_ep, ep_total, ep_rank_offset):
+    local_ep = max(int(local_ep), 1)
+    ep_total = max(int(ep_total), 1)
+    ep_rank_offset = int(ep_rank_offset)
+    if ep_rank_offset < 0 or ep_rank_offset + local_ep > ep_total:
+        raise ValueError(
+            f"Invalid EP rank slice: offset={ep_rank_offset}, "
+            f"local_ep={local_ep}, ep_total={ep_total}"
+        )
+    return range(ep_rank_offset, ep_rank_offset + local_ep)
+
+
 class GateRouter:
     """Simulator-side model of the MoE gate + expert dispatch.
 
