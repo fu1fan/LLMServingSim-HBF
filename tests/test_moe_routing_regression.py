@@ -39,6 +39,15 @@ class MoERoutingRegressionTest(unittest.TestCase):
         self.assertEqual(result.activated_experts, [4, 3, 2, 4])
         self.assertEqual(result.source_tokens, [4, 3, 3, 3])
 
+    def test_balanced_is_independent_of_block_copy_setting(self):
+        enabled = GateRouter(0, 0, 16, 2, "BALANCED", block_copy=True)
+        disabled = GateRouter(0, 0, 16, 2, "BALANCED", block_copy=False)
+
+        self.assertEqual(
+            enabled.route_ep(7, "batch", 127, 4),
+            disabled.route_ep(7, "batch", 127, 4),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

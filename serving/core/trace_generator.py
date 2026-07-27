@@ -115,6 +115,7 @@ class TraceCtx:
     local_ep: int      # expert parallel degree within this instance
     ep_total: int      # total EP degree across DP group
     ep_rank_offset: int  # first global EP rank owned by this instance
+    routing_key: str     # shared stochastic-routing key for a DP-group wave
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
@@ -863,7 +864,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
+                     tp_dim=None, ep_dim=None, ep_rank_offset=0,
+                     routing_key=None, dp_sum_total_len=0,
                      hbf_mem=None):
     model_type = config.get('model_type')
     if not model_type:
@@ -904,6 +906,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         ep_rank_offset=ep_rank_offset,
+        routing_key=routing_key,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
         hbf_performance_source=hbf_performance_source,
     )
@@ -1153,7 +1156,13 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # full padded forward shape. Routing / ``_lookup_moe`` therefore see
     # the same per-rank padded value as every other dense layer.
     effective_total_len_compute = bctx.total_len
-    routing = ctx.gate.route_ep(layer_num, batch_id_str, effective_total_len_compute, ep_total)
+    routing = ctx.gate.route_ep(
+        layer_num,
+        batch_id_str,
+        effective_total_len_compute,
+        ep_total,
+        routing_key=ctx.routing_key,
+    )
 
     # AG/RS comm sizes are anchored to ``dp_sum_total_len``, which
     # ``serving/__main__.py`` sets to ``max_total_len`` (NOT ``max × dp_group_size``)
@@ -1479,7 +1488,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
+                      tp_dim=None, ep_dim=None, ep_rank_offset=0,
+                      routing_key=None, dp_sum_total_len=0,
                       hbf_mem=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
@@ -1488,6 +1498,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim,
                            ep_rank_offset=ep_rank_offset,
+                           routing_key=routing_key,
                            dp_sum_total_len=dp_sum_total_len,
                            hbf_mem=hbf_mem)
     bctx = _build_batch_ctx(batch, ctx)
@@ -1536,7 +1547,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
+                                  tp_dim=None, ep_dim=None, ep_rank_offset=0,
+                                  routing_key=None, dp_sum_total_len=0,
                                   hbf_mem=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
@@ -1545,6 +1557,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim,
                            ep_rank_offset=ep_rank_offset,
+                           routing_key=routing_key,
                            dp_sum_total_len=dp_sum_total_len,
                            hbf_mem=hbf_mem)
     bctx1 = _build_batch_ctx(batches[0], ctx)
@@ -1641,7 +1654,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, ep_rank_offset=0, dp_sum_total_len=0,
+                   tp_dim=None, ep_dim=None, ep_rank_offset=0,
+                   routing_key=None, dp_sum_total_len=0,
                    enable_block_copy=True, inputs_root=None, hbf_mem=None,
                    expert_routing_profile=None, expert_routing_seed=42):
 
@@ -1709,6 +1723,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim,
                         ep_rank_offset=ep_rank_offset,
+                        routing_key=routing_key,
                         dp_sum_total_len=dp_sum_total_len,
                         hbf_mem=hbf_mem)
     if not enable_sub_batch_interleaving:

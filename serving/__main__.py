@@ -673,6 +673,7 @@ def main():
                     first_inst_id = dp_groups[dg][0]
                     first_batch = dp_pending[dg][first_inst_id][0]
                     dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
+                    routing_key = f"dp:{dg}:batch:{first_batch.batch_id}"
 
                     for inst_id in dp_groups[dg]:
                         batch, nid = dp_pending[dg][inst_id]
@@ -690,6 +691,7 @@ def main():
                                        dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        ep_rank_offset=inst.get("ep_rank_offset", 0),
+                                       routing_key=routing_key,
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        inputs_root=run_paths.inputs_root,
@@ -744,6 +746,7 @@ def main():
                         first_inst_id = dp_groups[dg][0]
                         first_batch = dp_pending[dg][first_inst_id][0]
                         dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
+                        routing_key = f"dp:{dg}:batch:{first_batch.batch_id}"
 
                         for inst_id in dp_groups[dg]:
                             batch, nid = dp_pending[dg][inst_id]
@@ -761,6 +764,7 @@ def main():
                                            dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            ep_rank_offset=inst.get("ep_rank_offset", 0),
+                                           routing_key=routing_key,
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            inputs_root=run_paths.inputs_root,
