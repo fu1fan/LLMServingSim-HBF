@@ -1483,6 +1483,16 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
+def _trace_copy_plan(ctx, num_layers, block_mode_on):
+    can_copy = (
+        (not ctx.is_moe or ctx.gate.block_copy)
+        and not block_mode_on
+    )
+    if can_copy:
+        return 1, num_layers, True
+    return num_layers, 1, False
+
+
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                       batch, max_len, output_path, placement, block_mode_on, gate,
                       enable_attn_offloading, power_model, pim_model, fp,
@@ -1515,16 +1525,13 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
         # Transformer blocks
         num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
+        iter_count, copy_count, can_copy = _trace_copy_plan(
+            ctx, num_layers, block_mode_on
+        )
 
         for layer_num in range(iter_count):
             block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
             if can_copy:
                 for _ in range(copy_count):
                     f.writelines(block_lines)
@@ -1599,7 +1606,9 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
         # MIDDLE LAYERS: interleaved post_attn + pre_attn
         middle_layers = num_layers - 1
-        iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
+        iter_count, copy_count, can_copy = _trace_copy_plan(
+            ctx, middle_layers, block_mode_on
+        )
 
         for layer_num in range(iter_count):
             block_lines = []
@@ -1613,11 +1622,6 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
             _emit_post_attn_layers(ctx, bctx2, layer_num, block_lines, block_power, f"{batches[1].batch_id}.1", 'BATCH_2')
             _emit_pre_attn_layers(ctx, bctx2, layer_num + 1, block_lines, block_power, 'BATCH_2')
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
             if can_copy:
                 for _ in range(copy_count):
                     f.writelines(block_lines)
