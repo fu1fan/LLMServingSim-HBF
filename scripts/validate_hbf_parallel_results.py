@@ -7,7 +7,7 @@ import csv
 import json
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 try:
@@ -32,6 +32,7 @@ PAIR_METRICS = (
     "generation_throughput_tok_s",
     "total_throughput_tok_s",
 )
+EXPECTED_STATIC_RUN_COUNT = 1176
 
 
 def gini(values):
@@ -215,6 +216,55 @@ def discover_runs(output_root):
     return sorted(
         path.parent for path in output_root.rglob("manifest.json")
     )
+
+
+def audit_plan_coverage(output_root, rows):
+    plan_path = output_root / "plan.json"
+    if not plan_path.is_file():
+        return {
+            "status": "fail",
+            "expected_run_count": EXPECTED_STATIC_RUN_COUNT,
+            "planned_run_count": 0,
+            "manifest_run_count": len(rows),
+            "missing_run_ids": [],
+            "extra_run_ids": [],
+            "duplicate_plan_run_ids": [],
+            "duplicate_manifest_run_ids": [],
+            "reason": "plan.json is missing",
+        }
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    planned = [run["run_id"] for run in plan.get("runs", [])]
+    actual = [row["run_id"] for row in rows]
+    planned_counts = Counter(planned)
+    actual_counts = Counter(actual)
+    missing = sorted(set(planned) - set(actual))
+    extra = sorted(set(actual) - set(planned))
+    duplicate_plan = sorted(
+        run_id for run_id, count in planned_counts.items() if count != 1
+    )
+    duplicate_actual = sorted(
+        run_id for run_id, count in actual_counts.items() if count != 1
+    )
+    valid = (
+        plan.get("phase") == "all"
+        and len(planned) == EXPECTED_STATIC_RUN_COUNT
+        and not missing
+        and not extra
+        and not duplicate_plan
+        and not duplicate_actual
+    )
+    return {
+        "status": "pass" if valid else "fail",
+        "expected_run_count": EXPECTED_STATIC_RUN_COUNT,
+        "planned_run_count": len(planned),
+        "manifest_run_count": len(actual),
+        "missing_run_ids": missing,
+        "extra_run_ids": extra,
+        "duplicate_plan_run_ids": duplicate_plan,
+        "duplicate_manifest_run_ids": duplicate_actual,
+        "reason": "" if valid else "plan-to-manifest coverage mismatch",
+    }
 
 
 def _pair_key(row, include_routing=True):
@@ -410,6 +460,7 @@ def validate(args):
         compare_hbm_hbf_identity(rows) + compare_routing(rows)
     )
     winners = select_winners(completed, manifest["selection"])
+    coverage = audit_plan_coverage(output_root, rows)
 
     write_csv(output_root / "summary.csv", completed)
     write_csv(output_root / "failures.csv", failures)
@@ -423,10 +474,41 @@ def validate(args):
         if row["comparison"] == "hbm-hbf-k1-identity"
         and row["status"] == "fail"
     ]
+    failure_classes = Counter(
+        row.get("failure_class", "unclassified") for row in failures
+    )
+    validation = {
+        "schema_version": 1,
+        "status": (
+            "pass"
+            if coverage["status"] == "pass" and not identity_failures
+            else "fail"
+        ),
+        "coverage": coverage,
+        "completed_run_count": len(completed),
+        "failed_run_count": len(failures),
+        "failure_classes": dict(sorted(failure_classes.items())),
+        "identity_comparison_failure_count": len(identity_failures),
+    }
+    (output_root / "validation.json").write_text(
+        json.dumps(validation, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    errors = []
+    if coverage["status"] != "pass":
+        errors.append(
+            "static matrix coverage mismatch: "
+            f"planned={coverage['planned_run_count']} "
+            f"manifests={coverage['manifest_run_count']} "
+            f"missing={len(coverage['missing_run_ids'])} "
+            f"extra={len(coverage['extra_run_ids'])}"
+        )
     if identity_failures:
-        raise RuntimeError(
+        errors.append(
             f"{len(identity_failures)} HBM/HBF k=1 pairs differ"
         )
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def build_parser():

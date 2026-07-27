@@ -35,6 +35,56 @@ def row(topology, per_device, total, ttft, tpot):
 
 
 class ValidateHbfParallelResultsTests(unittest.TestCase):
+    def test_plan_coverage_requires_all_1176_run_ids(self):
+        run_ids = [
+            f"run-{index}"
+            for index in range(validator.EXPECTED_STATIC_RUN_COUNT)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "phase": "all",
+                        "runs": [
+                            {"run_id": run_id} for run_id in run_ids
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = validator.audit_plan_coverage(
+                root,
+                [{"run_id": run_id} for run_id in run_ids],
+            )
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["manifest_run_count"], 1176)
+
+    def test_plan_coverage_reports_missing_run_id(self):
+        run_ids = [
+            f"run-{index}"
+            for index in range(validator.EXPECTED_STATIC_RUN_COUNT)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "phase": "all",
+                        "runs": [
+                            {"run_id": run_id} for run_id in run_ids
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = validator.audit_plan_coverage(
+                root,
+                [{"run_id": run_id} for run_id in run_ids[:-1]],
+            )
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["missing_run_ids"], [run_ids[-1]])
+
     def test_routing_log_statistics_are_recomputed(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "simulator.log"
