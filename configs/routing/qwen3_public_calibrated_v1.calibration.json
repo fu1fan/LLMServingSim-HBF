@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "profile_id": "qwen3-public-calibrated-v1",
+  "profile_sha256": "ee645e16a1f95389fe273d2b5c108eee9559482f4c538b7996eb11d05fc9fb56",
+  "sampler": "plackett_luce_gumbel_topk",
+  "reference_tokens": 6240,
+  "top_k": 8,
+  "num_seeds": 64,
+  "seeds": "0..63",
+  "observed_mean": {
+    "cv": 0.548461198,
+    "gini": 0.298907686,
+    "top5_share": 0.098410895,
+    "top10_share": 0.176198480
+  },
+  "observed_stddev": {
+    "cv": 0.004861844,
+    "gini": 0.002396201,
+    "top5_share": 0.001369071,
+    "top10_share": 0.001601294
+  },
+  "acceptance_tolerance": {
+    "cv": 0.03,
+    "gini": 0.02,
+    "top5_share": 0.01,
+    "top10_share": 0.015
+  },
+  "status": "pass"
+}
