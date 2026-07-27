@@ -523,7 +523,7 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
         previous = json.loads(
             previous_manifest.read_text(encoding="utf-8")
         )
-        if previous.get("status") == "completed":
+        if previous.get("status") in ("completed", "failed"):
             return spec.run_id, "skipped", 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
