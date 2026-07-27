@@ -38,6 +38,8 @@ matching runtime knobs per `instances[i]`; see
 | --- | --- | --- | --- |
 | `--request-routing-policy` | `LOAD` / `RR` / `RAND` / `CUSTOM` | `LOAD` | Cross-instance request routing |
 | `--expert-routing-policy` | `BALANCED` / `RR` / `RAND` / `CUSTOM` | `BALANCED` | MoE expert token routing |
+| `--expert-routing-profile` | path | `None` | Schema-v1 calibrated profile; required for expert `CUSTOM`, rejected for other policies |
+| `--expert-routing-seed` | integer | `42` | Stable expert-mapping and token-sampling seed |
 | `--enable-block-copy` | bool | `True` | Replay one block's trace across layers (set False for per-layer EP variance) |
 
 ## Precision
@@ -73,8 +75,11 @@ matching runtime knobs per `instances[i]`; see
 | --- | --- | --- | --- |
 | `--hbf-latency-scale` | positive float | config value | Override every scale-based HBF instance for this process. Rejected for external-profile sources |
 
-For multi-point scans, use `python scripts/hbf_sweep.py` so every
-coefficient runs in a fresh simulator process. See
+For single-topology scans, use `python scripts/hbf_sweep.py`. For the
+native-parallel dual-routing matrix, use
+`python scripts/hbf_parallel_matrix.py` and validate it with
+`python scripts/validate_hbf_parallel_results.py`. Every coefficient
+runs in a fresh simulator process. See
 **[HBF static-weight backend](/docs/examples/memory-tiers/hbf-static-weights)**.
 
 ## Run isolation
@@ -112,6 +117,7 @@ removed after a successful simulation by default.
 | FP8 KV cache | `--kv-cache-dtype fp8` |
 | ns3 backend | `--network-backend ns3` |
 | HBF weight sensitivity | cluster `hbf_mem` + `python scripts/hbf_sweep.py` |
+| HBF parallel matrix | `python scripts/hbf_parallel_matrix.py` |
 
 For the full conceptual treatment of each feature, browse the
 **[Simulator](/docs/simulator/architecture)** section. For runnable

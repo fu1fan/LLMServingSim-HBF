@@ -129,6 +129,12 @@ schema. Top-level structure:
   "model_name": "Qwen/Qwen3-32B",
   "hardware": "RTXPRO6000",
   "npu_mem": {"mem_size": 96, "mem_bw": 1597, "mem_latency": 0},
+  "hbf_mem": {
+    "schema_version": 1,
+    "num_stacks": 8,
+    "stack_capacity_gb": 512,
+    "performance": {"source": "scale", "latency_scale": 1.0}
+  },
   "num_npus": 2,
   "tp_size": 2,
   "pp_size": 1,
@@ -150,6 +156,7 @@ schema. Top-level structure:
 | `npu_mem.mem_size` | float | Per-GPU NPU memory in **GB** |
 | `npu_mem.mem_bw` | float | Per-GPU NPU memory bandwidth in **GB/s** |
 | `npu_mem.mem_latency` | float | Per-GPU NPU memory latency in **ns** |
+| `hbf_mem` | object | Optional per-GPU HBF static-weight tier; absent preserves the original path |
 | `pd_type` | string \| null | `"prefill"`, `"decode"`, or `null` (combined) |
 
 ### Parallelism (at least one of `num_npus` / `tp_size`)
@@ -218,9 +225,27 @@ Each rule object has three string fields:
 
 | Field | Allowed values | Description |
 | --- | --- | --- |
-| `weights` | `npu` / `cpu` / `cxl:<id>` | Where this layer's weights live |
+| `weights` | `npu` / `hbf` / `cpu` / `cxl:<id>` | Where this layer's weights live |
 | `kv_loc` | `npu` / `cpu` / `cxl:<id>` | Where active KV blocks live (attention layers only) |
 | `kv_evict_loc` | `npu` / `cpu` / `cxl:<id>` | Where evicted KV blocks spill |
+
+### `hbf_mem` (per instance, optional)
+
+HBF is a logical static-weight tier. Capacity is
+`num_stacks * stack_capacity_gb` GiB per GPU; both values are
+configuration, not hardware constants. `performance.source` is
+either:
+
+- `scale`: multiply only HBF-resident weight operators by the
+  positive `latency_scale`.
+- `profile`: replace those operator latencies from a complete,
+  schema-v1 external profile bundle.
+
+HBF operator time is inserted before trace emission and the logical
+location is lowered to `LOCAL`; ASTRA-Sim is not given a new memory
+type. KV, prefix, and activation placement remain on existing
+NPU/CPU/CXL paths. `kv_loc: hbf` and `kv_evict_loc: hbf` are reserved
+and fail explicitly.
 
 `blocks` strings are dash-and-comma-separated ranges:
 `"0-3"`, `"4-7"`, `"8,9,10"`, `"11-23"`. Layer-name keys must match

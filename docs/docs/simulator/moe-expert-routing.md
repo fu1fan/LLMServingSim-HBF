@@ -28,13 +28,14 @@ GateRouter(
     routing_policy='BALANCED',     # one of 4 policies, see below
     seed=42,
     block_copy=True,
+    custom_profile=None,          # required only for CUSTOM
 )
 
 result = router.route(num_tokens=T, tp_rank=r, num_experts_per_token=K)
 # → RoutingResult(local_tokens=[...], activated_experts=[...], source_tokens=[...])
 ```
 
-`local_tokens[i]` is the number of tokens assigned to EP rank `i`
+`local_tokens[i]` is the number of tokens assigned to global EP rank `i`
 after dispatch. `activated_experts[i]` is the count of distinct
 experts touched on that rank. Both feed into the per-rank attention/MLP
 latency lookup.
@@ -53,7 +54,7 @@ flowchart LR
         TN["8 tokens"] --> ASN["3, 1, 0, 4<br/>(seeded uniform)"]
     end
     subgraph CST["CUSTOM"]
-        TC["8 tokens"] --> ASC["whatever you<br/>write"]
+        TC["8 tokens"] --> ASC["calibrated weighted<br/>top-K sample"]
     end
 ```
 
@@ -62,7 +63,7 @@ flowchart LR
 | **BALANCED** (default) | Deterministic | Idealized load-balanced gate (post-aux-loss training) | Most research baselines |
 | **RR** | Deterministic | Pure round-robin assignment | Sanity / null-baseline runs |
 | **RAND** | Seeded random | Uniform random per token | Worst-case load imbalance studies |
-| **CUSTOM** | Plug-in | Whatever you write | Real trained gate weights, ablation |
+| **CUSTOM** | Seeded deterministic | Versioned, calibrated synthetic marginal | Public-statistics sensitivity analysis |
 
 ### BALANCED, closed-form pigeonhole
 
@@ -95,12 +96,36 @@ for reproducibility). Produces realistic worst-case load imbalance
 *untrained* gate produces. Use this if you want to study the cost of
 load imbalance specifically.
 
-### CUSTOM, plug-in
+### CUSTOM, calibrated synthetic routing
 
-Edit `gate_function.py::GateRouter._custom_routing`. The hook
-receives the token list and returns expert assignments per token.
-Use this if you want to drive routing from real trained gate weights
-or a learned-from-trace model.
+CUSTOM loads a schema-v1 JSON profile with a 128-entry marginal
+histogram and fitted selection weights. For each token it performs a
+Plackett-Luce sample using Gumbel top-K, so selected experts are
+distinct. SHA256-derived seeds and NumPy PCG64 make results
+reproducible across Python processes.
+
+The runtime permutes the sorted weight distribution per layer. This
+preserves the calibrated skew shape without treating public-sample
+expert IDs as portable model semantics:
+
+```bash
+python -m serving \
+  --expert-routing-policy CUSTOM \
+  --expert-routing-profile configs/routing/qwen3_public_calibrated_v1.json \
+  --expert-routing-seed 42 \
+  --no-enable-block-copy \
+  ...
+```
+
+CUSTOM fails at startup if the profile model, expert count, or top-K
+does not match the model config. Supplying a profile with any other
+policy is rejected. Schema v1 has layer-specific permutations, so
+`--no-enable-block-copy` is mandatory.
+
+The bundled Qwen3 profile is calibrated from a community-published
+aggregate example. It is evidence for an aggregate skew sensitivity
+case, not for real expert identities, workload mix, or per-token
+routing of a particular Qwen3-235B revision.
 
 ## Expert-to-rank assignment
 
@@ -201,6 +226,10 @@ across the DP group, see
 5. **Dummy batches in DP groups still route through the gate.**
    1-token dummy batches go through routing exactly like real
    batches, so DP+EP results are consistent across waves.
+6. **DP-group instances consume global EP slices.** Instance rank
+   `d` reads `[d * local_ep:(d + 1) * local_ep]` from the shared
+   routing result. A stable wave key ensures every member samples the
+   same global route.
 
 ## What's next
 
