@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -292,9 +292,9 @@ class HbfParallelMatrixTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch.object(
-                matrix.subprocess,
-                "run",
-                return_value=type("Result", (), {"returncode": 1})(),
+                matrix,
+                "_run_monitored_command",
+                return_value=(1, None, None),
             ) as run:
                 result = matrix._run_one(
                     REPO_ROOT,
@@ -308,6 +308,151 @@ class HbfParallelMatrixTests(unittest.TestCase):
                 )
         self.assertEqual(result, (spec.run_id, "failed", 1))
         run.assert_called_once()
+
+    def test_recorded_timeout_is_not_retried_by_default(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({
+                    "status": "failed",
+                    "failure_kind": "stall_timeout",
+                }),
+                encoding="utf-8",
+            )
+            with patch.object(
+                matrix, "_run_monitored_command"
+            ) as run:
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=True,
+                )
+        self.assertEqual(result, (spec.run_id, "skipped", 0))
+        run.assert_not_called()
+
+    def test_timeout_failure_is_recorded_with_watchdog_provenance(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with patch.object(
+                matrix,
+                "_run_monitored_command",
+                return_value=(
+                    124,
+                    "stall_timeout",
+                    "zero throughput with unchanged request state",
+                ),
+            ):
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=False,
+                    run_timeout_seconds=7200,
+                    stall_timeout_seconds=600,
+                    stall_sim_seconds=3600,
+                )
+            recorded = json.loads(
+                (run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(result, (spec.run_id, "failed", 124))
+        self.assertEqual(recorded["failure_kind"], "stall_timeout")
+        self.assertEqual(
+            recorded["watchdog"]["stall_sim_seconds"], 3600
+        )
+
+    def test_progress_snapshot_uses_latest_status_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "simulator.log"
+            log_path.write_text(
+                "[10.0s] Avg prompt throughput: 1.0 tokens/s, "
+                "Avg generation throughput: 0.0 tokens/s\n"
+                "Running Instance[0]: 2 reqs, Waiting: 4 reqs\n"
+                "[20.0s] Avg prompt throughput: 0.0 tokens/s, "
+                "Avg generation throughput: 0.0 tokens/s\n"
+                "Running Instance[0]: 2 reqs, Waiting: 4 reqs\n"
+                "Running Instance[1]: 1 reqs, Waiting: 5 reqs\n",
+                encoding="utf-8",
+            )
+            snapshot = matrix._read_progress_snapshot(log_path)
+        self.assertEqual(snapshot["sim_seconds"], 20.0)
+        self.assertEqual(snapshot["prompt_throughput"], 0.0)
+        self.assertEqual(
+            snapshot["instances"],
+            ((0, 2, 4), (1, 1, 5)),
+        )
+
+    def test_watchdog_cli_defaults_are_bounded(self):
+        args = matrix.build_parser().parse_args([
+            "--output-dir", "/tmp/results",
+        ])
+        self.assertEqual(
+            args.run_timeout_seconds,
+            matrix.DEFAULT_RUN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            args.stall_timeout_seconds,
+            matrix.DEFAULT_STALL_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            args.stall_sim_seconds,
+            matrix.DEFAULT_STALL_SIM_SECONDS,
+        )
+
+    def test_monitored_command_stops_zero_throughput_stall(self):
+        process = MagicMock()
+        process.pid = 123
+        process.poll.side_effect = [None, None]
+        snapshots = [
+            {
+                "sim_seconds": 10.0,
+                "prompt_throughput": 0.0,
+                "generation_throughput": 0.0,
+                "instances": ((0, 2, 4),),
+            },
+            {
+                "sim_seconds": 4010.0,
+                "prompt_throughput": 0.0,
+                "generation_throughput": 0.0,
+                "instances": ((0, 2, 4),),
+            },
+        ]
+        with (
+            patch.object(matrix.subprocess, "Popen", return_value=process),
+            patch.object(
+                matrix.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 601.0],
+            ),
+            patch.object(matrix.time, "sleep"),
+            patch.object(
+                matrix,
+                "_read_progress_snapshot",
+                side_effect=snapshots,
+            ),
+            patch.object(matrix, "_terminate_process_group") as terminate,
+        ):
+            result = matrix._run_monitored_command(
+                ["python"],
+                REPO_ROOT,
+                MagicMock(),
+                Path("/tmp/simulator.log"),
+                run_timeout_seconds=7200,
+                stall_timeout_seconds=600,
+                stall_sim_seconds=3600,
+            )
+        self.assertEqual(result[0:2], (124, "stall_timeout"))
+        terminate.assert_called_once_with(process)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,11 @@ import copy
 import hashlib
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -15,6 +18,20 @@ from pathlib import Path
 
 DEFAULT_MANIFEST = "configs/experiments/hbf_parallel_modes_v1.json"
 STRESS_SCALES = (1.0, 4.0, 10.0)
+DEFAULT_RUN_TIMEOUT_SECONDS = 7200
+DEFAULT_STALL_TIMEOUT_SECONDS = 600
+DEFAULT_STALL_SIM_SECONDS = 3600
+TIMEOUT_FAILURE_KINDS = frozenset({"stall_timeout", "wall_timeout"})
+STATUS_RE = re.compile(
+    r"^\[(?P<sim_seconds>[0-9.]+)s\] Avg prompt throughput: "
+    r"(?P<prompt>[0-9.]+) tokens/s, Avg generation throughput: "
+    r"(?P<generation>[0-9.]+) tokens/s",
+    re.MULTILINE,
+)
+INSTANCE_RE = re.compile(
+    r"Running Instance\[(?P<instance>[0-9]+)\]: "
+    r"(?P<running>[0-9]+) reqs, Waiting: (?P<waiting>[0-9]+) reqs"
+)
 
 
 @dataclass(frozen=True)
@@ -522,8 +539,138 @@ def _positive_int(value):
     return value
 
 
+def _positive_float(value):
+    value = float(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
+
+
+def _read_tail(path, max_bytes=262144):
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes))
+            return stream.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _read_progress_snapshot(log_path):
+    text = _read_tail(log_path)
+    matches = list(STATUS_RE.finditer(text))
+    if not matches:
+        return None
+    status = matches[-1]
+    instances = tuple(
+        (
+            int(match.group("instance")),
+            int(match.group("running")),
+            int(match.group("waiting")),
+        )
+        for match in INSTANCE_RE.finditer(text[status.end():])
+    )
+    return {
+        "sim_seconds": float(status.group("sim_seconds")),
+        "prompt_throughput": float(status.group("prompt")),
+        "generation_throughput": float(status.group("generation")),
+        "instances": instances,
+    }
+
+
+def _terminate_process_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait()
+
+
+def _run_monitored_command(command, repo_root, log, log_path,
+                           run_timeout_seconds, stall_timeout_seconds,
+                           stall_sim_seconds, poll_seconds=5):
+    process = subprocess.Popen(
+        command,
+        cwd=repo_root,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    started = time.monotonic()
+    last_progress = started
+    baseline_sim_seconds = None
+    last_instances = None
+    failure_kind = None
+    failure_detail = None
+
+    while process.poll() is None:
+        now = time.monotonic()
+        if now - started >= run_timeout_seconds:
+            failure_kind = "wall_timeout"
+            failure_detail = (
+                f"wall clock exceeded {run_timeout_seconds:g} seconds"
+            )
+            break
+
+        snapshot = _read_progress_snapshot(log_path)
+        if snapshot is not None:
+            has_throughput = (
+                snapshot["prompt_throughput"] > 0
+                or snapshot["generation_throughput"] > 0
+            )
+            instances = snapshot["instances"]
+            state_changed = (
+                last_instances is not None and instances != last_instances
+            )
+            if (
+                baseline_sim_seconds is None
+                or has_throughput
+                or state_changed
+            ):
+                last_progress = now
+                baseline_sim_seconds = snapshot["sim_seconds"]
+            last_instances = instances
+            simulated_stall = (
+                snapshot["sim_seconds"] - baseline_sim_seconds
+                if baseline_sim_seconds is not None
+                else 0
+            )
+            if (
+                not has_throughput
+                and now - last_progress >= stall_timeout_seconds
+                and simulated_stall >= stall_sim_seconds
+            ):
+                failure_kind = "stall_timeout"
+                failure_detail = (
+                    "zero throughput with unchanged request state for "
+                    f"{now - last_progress:.1f} wall seconds while simulated "
+                    f"time advanced {simulated_stall:.1f} seconds"
+                )
+                break
+        time.sleep(poll_seconds)
+
+    if failure_kind is not None:
+        _terminate_process_group(process)
+        return 124, failure_kind, failure_detail
+    return process.returncode, None, None
+
+
 def _run_one(repo_root, manifest, spec, run_dir, command,
-             code_sha, profile_bundle_sha, rerun_failed):
+             code_sha, profile_bundle_sha, rerun_failed,
+             run_timeout_seconds=DEFAULT_RUN_TIMEOUT_SECONDS,
+             stall_timeout_seconds=DEFAULT_STALL_TIMEOUT_SECONDS,
+             stall_sim_seconds=DEFAULT_STALL_SIM_SECONDS,
+             retry_timeouts=False):
     previous_manifest = run_dir / "manifest.json"
     if previous_manifest.is_file():
         previous = json.loads(
@@ -532,8 +679,14 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
         previous_status = previous.get("status")
         if previous_status == "completed":
             return spec.run_id, "skipped", 0
-        if previous_status == "failed" and not rerun_failed:
-            return spec.run_id, "skipped", 0
+        if previous_status == "failed":
+            if (
+                previous.get("failure_kind") in TIMEOUT_FAILURE_KINDS
+                and not retry_timeouts
+            ):
+                return spec.run_id, "skipped", 0
+            if not rerun_failed:
+                return spec.run_id, "skipped", 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
     cluster_path = run_dir / "cluster.json"
@@ -541,20 +694,22 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
     log_path = run_dir / "simulator.log"
     print(f"[run] {spec.run_id}", flush=True)
     with log_path.open("w", encoding="utf-8") as log:
-        completed = subprocess.run(
+        exit_code, failure_kind, failure_detail = _run_monitored_command(
             command,
-            cwd=repo_root,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            check=False,
+            repo_root,
+            log,
+            log_path,
+            run_timeout_seconds,
+            stall_timeout_seconds,
+            stall_sim_seconds,
         )
-    status = "completed" if completed.returncode == 0 else "failed"
+    status = "completed" if exit_code == 0 else "failed"
     run_manifest = {
         "schema_version": 1,
         "experiment_id": manifest["experiment_id"],
         "run_id": spec.run_id,
         "status": status,
-        "exit_code": completed.returncode,
+        "exit_code": exit_code,
         "git_sha": code_sha,
         "profile_bundle_sha256": profile_bundle_sha,
         "spec": asdict(spec),
@@ -571,14 +726,22 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
             else None
         ),
         "command": command,
+        "watchdog": {
+            "run_timeout_seconds": run_timeout_seconds,
+            "stall_timeout_seconds": stall_timeout_seconds,
+            "stall_sim_seconds": stall_sim_seconds,
+        },
         "outputs": {
             "requests": os.fspath(run_dir / "requests.csv"),
             "runtime": os.fspath(run_dir / "runtime.json"),
             "log": os.fspath(log_path),
         },
     }
+    if failure_kind is not None:
+        run_manifest["failure_kind"] = failure_kind
+        run_manifest["failure_detail"] = failure_detail
     write_json(previous_manifest, run_manifest)
-    return spec.run_id, status, completed.returncode
+    return spec.run_id, status, exit_code
 
 
 def _run_specs(repo_root, manifest, jobs, keep_going, run_args):
@@ -679,6 +842,10 @@ def run_matrix(args):
             code_sha,
             profile_bundle_sha,
             args.rerun_failed,
+            args.run_timeout_seconds,
+            args.stall_timeout_seconds,
+            args.stall_sim_seconds,
+            args.retry_timeouts,
         ))
 
     failures = []
@@ -734,6 +901,29 @@ def build_parser():
     )
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--rerun-failed", action="store_true")
+    parser.add_argument(
+        "--retry-timeouts",
+        action="store_true",
+        help="rerun failures previously classified as watchdog timeouts",
+    )
+    parser.add_argument(
+        "--run-timeout-seconds",
+        type=_positive_float,
+        default=DEFAULT_RUN_TIMEOUT_SECONDS,
+        help="absolute wall-clock limit for one simulator subprocess",
+    )
+    parser.add_argument(
+        "--stall-timeout-seconds",
+        type=_positive_float,
+        default=DEFAULT_STALL_TIMEOUT_SECONDS,
+        help="wall-clock zero-throughput interval before stall detection",
+    )
+    parser.add_argument(
+        "--stall-sim-seconds",
+        type=_positive_float,
+        default=DEFAULT_STALL_SIM_SECONDS,
+        help="minimum simulated-time advance required to classify a stall",
+    )
     return parser
 
 
