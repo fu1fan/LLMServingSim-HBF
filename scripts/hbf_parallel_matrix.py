@@ -22,6 +22,10 @@ DEFAULT_RUN_TIMEOUT_SECONDS = 7200
 DEFAULT_STALL_TIMEOUT_SECONDS = 600
 DEFAULT_STALL_SIM_SECONDS = 3600
 TIMEOUT_FAILURE_KINDS = frozenset({"stall_timeout", "wall_timeout"})
+NON_RETRYABLE_FAILURE_KINDS = frozenset({
+    "capacity_precheck",
+    *TIMEOUT_FAILURE_KINDS,
+})
 STATUS_RE = re.compile(
     r"^\[(?P<sim_seconds>[0-9.]+)s\] Avg prompt throughput: "
     r"(?P<prompt>[0-9.]+) tokens/s, Avg generation throughput: "
@@ -579,6 +583,18 @@ def _read_progress_snapshot(log_path):
     }
 
 
+def _infer_failure(log_path):
+    text = _read_tail(log_path)
+    for line in reversed(text.splitlines()):
+        if (
+            "capacity exceeded:" in line
+            and "required=" in line
+            and "available=" in line
+        ):
+            return "capacity_precheck", line.strip()
+    return None, None
+
+
 def _read_process_identity(pid, proc_root=Path("/proc")):
     try:
         stat = (proc_root / str(pid) / "stat").read_text(
@@ -752,9 +768,21 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
         if previous_status == "completed":
             return spec.run_id, "skipped", 0
         if previous_status == "failed":
+            failure_kind = previous.get("failure_kind")
+            if failure_kind is None:
+                failure_kind, failure_detail = _infer_failure(
+                    run_dir / "simulator.log"
+                )
+                if failure_kind is not None:
+                    previous["failure_kind"] = failure_kind
+                    previous["failure_detail"] = failure_detail
+                    write_json(previous_manifest, previous)
             if (
-                previous.get("failure_kind") in TIMEOUT_FAILURE_KINDS
-                and not retry_timeouts
+                failure_kind in NON_RETRYABLE_FAILURE_KINDS
+                and (
+                    failure_kind not in TIMEOUT_FAILURE_KINDS
+                    or not retry_timeouts
+                )
             ):
                 return spec.run_id, "skipped", 0
             if not rerun_failed:
@@ -775,6 +803,8 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
             stall_timeout_seconds,
             stall_sim_seconds,
         )
+    if exit_code != 0 and failure_kind is None:
+        failure_kind, failure_detail = _infer_failure(log_path)
     status = "completed" if exit_code == 0 else "failed"
     run_manifest = {
         "schema_version": 1,

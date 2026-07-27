@@ -336,6 +336,84 @@ class HbfParallelMatrixTests(unittest.TestCase):
         self.assertEqual(result, (spec.run_id, "skipped", 0))
         run.assert_not_called()
 
+    def test_legacy_capacity_failure_is_classified_and_not_retried(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            manifest_path = run_dir / "manifest.json"
+            manifest_path.write_text(
+                json.dumps({"status": "failed"}),
+                encoding="utf-8",
+            )
+            (run_dir / "simulator.log").write_text(
+                "RuntimeError: HBM weight capacity exceeded: "
+                "required=811706777600 available=193273528320\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                matrix, "_run_monitored_command"
+            ) as run:
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=True,
+                )
+            recorded = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        self.assertEqual(result, (spec.run_id, "skipped", 0))
+        self.assertEqual(
+            recorded["failure_kind"], "capacity_precheck"
+        )
+        run.assert_not_called()
+
+    def test_new_capacity_failure_records_non_retryable_kind(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+
+            def fail_with_capacity(
+                _command,
+                _repo_root,
+                log,
+                _log_path,
+                *_args,
+            ):
+                log.write(
+                    "RuntimeError: HBF weight capacity exceeded: "
+                    "required=20 available=10\n"
+                )
+                log.flush()
+                return 1, None, None
+
+            with patch.object(
+                matrix,
+                "_run_monitored_command",
+                side_effect=fail_with_capacity,
+            ):
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=False,
+                )
+            recorded = json.loads(
+                (run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(result, (spec.run_id, "failed", 1))
+        self.assertEqual(
+            recorded["failure_kind"], "capacity_precheck"
+        )
+
     def test_timeout_failure_is_recorded_with_watchdog_provenance(self):
         spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
         with tempfile.TemporaryDirectory() as tmp:
