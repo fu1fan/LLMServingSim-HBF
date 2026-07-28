@@ -309,6 +309,31 @@ class HbfParallelMatrixTests(unittest.TestCase):
         self.assertEqual(result, (spec.run_id, "failed", 1))
         run.assert_called_once()
 
+    def test_unreadable_manifest_is_rerun(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "manifest.json").write_text(
+                "", encoding="utf-8"
+            )
+            with patch.object(
+                matrix,
+                "_run_monitored_command",
+                return_value=(1, None, None),
+            ) as run:
+                result = matrix._run_one(
+                    REPO_ROOT,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=False,
+                )
+        self.assertEqual(result, (spec.run_id, "failed", 1))
+        run.assert_called_once()
+
     def test_recorded_timeout_is_not_retried_by_default(self):
         spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
         with tempfile.TemporaryDirectory() as tmp:

@@ -773,35 +773,44 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
              run_timeout_seconds=DEFAULT_RUN_TIMEOUT_SECONDS,
              stall_timeout_seconds=DEFAULT_STALL_TIMEOUT_SECONDS,
              stall_sim_seconds=DEFAULT_STALL_SIM_SECONDS,
-             retry_timeouts=False):
+    retry_timeouts=False):
     previous_manifest = run_dir / "manifest.json"
     if previous_manifest.is_file():
-        previous = json.loads(
-            previous_manifest.read_text(encoding="utf-8")
-        )
-        previous_status = previous.get("status")
-        if previous_status == "completed":
-            return spec.run_id, "skipped", 0
-        if previous_status == "failed":
-            failure_kind = previous.get("failure_kind")
-            if failure_kind is None:
-                failure_kind, failure_detail = _infer_failure(
-                    run_dir / "simulator.log"
-                )
-                if failure_kind is not None:
-                    previous["failure_kind"] = failure_kind
-                    previous["failure_detail"] = failure_detail
-                    write_json(previous_manifest, previous)
-            if (
-                failure_kind in NON_RETRYABLE_FAILURE_KINDS
-                and (
-                    failure_kind not in TIMEOUT_FAILURE_KINDS
-                    or not retry_timeouts
-                )
-            ):
+        try:
+            previous = json.loads(
+                previous_manifest.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            previous = None
+        if previous is None:
+            print(
+                f"[rerun] {spec.run_id}: unreadable manifest",
+                flush=True,
+            )
+        else:
+            previous_status = previous.get("status")
+            if previous_status == "completed":
                 return spec.run_id, "skipped", 0
-            if not rerun_failed:
-                return spec.run_id, "skipped", 0
+            if previous_status == "failed":
+                failure_kind = previous.get("failure_kind")
+                if failure_kind is None:
+                    failure_kind, failure_detail = _infer_failure(
+                        run_dir / "simulator.log"
+                    )
+                    if failure_kind is not None:
+                        previous["failure_kind"] = failure_kind
+                        previous["failure_detail"] = failure_detail
+                        write_json(previous_manifest, previous)
+                if (
+                    failure_kind in NON_RETRYABLE_FAILURE_KINDS
+                    and (
+                        failure_kind not in TIMEOUT_FAILURE_KINDS
+                        or not retry_timeouts
+                    )
+                ):
+                    return spec.run_id, "skipped", 0
+                if not rerun_failed:
+                    return spec.run_id, "skipped", 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
     cluster_path = run_dir / "cluster.json"
