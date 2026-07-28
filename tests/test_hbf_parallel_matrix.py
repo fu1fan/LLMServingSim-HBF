@@ -414,6 +414,40 @@ class HbfParallelMatrixTests(unittest.TestCase):
             recorded["failure_kind"], "capacity_precheck"
         )
 
+    def test_failed_run_cleans_generated_simulator_inputs(self):
+        spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            inputs_root = (
+                repo_root / "astra-sim" / "inputs" / "runs"
+                / spec.run_id
+            )
+            inputs_root.mkdir(parents=True)
+            (inputs_root / "trace.et").write_text(
+                "generated", encoding="utf-8"
+            )
+            workload_path = repo_root / spec.workload_path
+            workload_path.parent.mkdir(parents=True)
+            workload_path.write_text("{}\n", encoding="utf-8")
+            run_dir = Path(tmp) / "results" / spec.run_id
+            with patch.object(
+                matrix,
+                "_run_monitored_command",
+                return_value=(1, None, None),
+            ):
+                result = matrix._run_one(
+                    repo_root,
+                    self.manifest,
+                    spec,
+                    run_dir,
+                    ["python"],
+                    "sha",
+                    "profile-sha",
+                    rerun_failed=False,
+                )
+            self.assertFalse(inputs_root.exists())
+        self.assertEqual(result, (spec.run_id, "failed", 1))
+
     def test_timeout_failure_is_recorded_with_watchdog_provenance(self):
         spec = matrix.expand_run_specs(self.manifest, "stage1")[0]
         with tempfile.TemporaryDirectory() as tmp:

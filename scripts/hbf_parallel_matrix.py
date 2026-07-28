@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -753,6 +754,20 @@ def _run_monitored_command(command, repo_root, log, log_path,
     return process.returncode, None, None
 
 
+def _cleanup_simulator_inputs(repo_root, run_id):
+    """Remove one matrix run's generated ASTRA-Sim inputs."""
+    runs_root = (
+        Path(repo_root) / "astra-sim" / "inputs" / "runs"
+    ).resolve()
+    inputs_root = (runs_root / run_id).resolve()
+    if inputs_root.parent != runs_root:
+        raise RuntimeError(
+            f"Refusing to remove inputs outside {runs_root}: "
+            f"{inputs_root}"
+        )
+    shutil.rmtree(inputs_root, ignore_errors=True)
+
+
 def _run_one(repo_root, manifest, spec, run_dir, command,
              code_sha, profile_bundle_sha, rerun_failed,
              run_timeout_seconds=DEFAULT_RUN_TIMEOUT_SECONDS,
@@ -793,16 +808,21 @@ def _run_one(repo_root, manifest, spec, run_dir, command,
     write_json(cluster_path, build_cluster_config(manifest, spec))
     log_path = run_dir / "simulator.log"
     print(f"[run] {spec.run_id}", flush=True)
-    with log_path.open("w", encoding="utf-8") as log:
-        exit_code, failure_kind, failure_detail = _run_monitored_command(
-            command,
-            repo_root,
-            log,
-            log_path,
-            run_timeout_seconds,
-            stall_timeout_seconds,
-            stall_sim_seconds,
-        )
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            exit_code, failure_kind, failure_detail = (
+                _run_monitored_command(
+                    command,
+                    repo_root,
+                    log,
+                    log_path,
+                    run_timeout_seconds,
+                    stall_timeout_seconds,
+                    stall_sim_seconds,
+                )
+            )
+    finally:
+        _cleanup_simulator_inputs(repo_root, spec.run_id)
     if exit_code != 0 and failure_kind is None:
         failure_kind, failure_detail = _infer_failure(log_path)
     status = "completed" if exit_code == 0 else "failed"
