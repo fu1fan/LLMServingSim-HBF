@@ -22,6 +22,7 @@ The radix tree data structure for managing the KV cache.
 import threading
 import heapq
 import time
+import logging
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, NamedTuple, Any
@@ -163,6 +164,12 @@ class RadixCache():
         self.capacity = capacity
         self.kv_size = kv_size
         self.kv_stored = 0 # Size of inference kv caches from xPU
+        # Token capacity of this cache: the tree must never exceed it, or the
+        # BlockStored events drained by MemoryModel.apply_kv_cache_events()
+        # would push npu_used/cpu_used past the device limit and crash with a
+        # RuntimeError instead of degrading gracefully (backpressure).
+        self.capacity_tokens = (capacity // kv_size) if kv_size > 0 else 0
+        self.dropped_tokens = 0  # tokens skipped because the cache was full
 
         # TODO: Currently saving unfulled chunk is not supported. TBA
         self.save_unfull_chunk = False
@@ -223,7 +230,38 @@ class RadixCache():
 
     def avail_size(self):
         return max(self.capacity - self.total_memory_usage(), 0)
-        
+
+    def _avail_tokens(self):
+        """Remaining token budget of this cache (0 when full or oversized)."""
+        if self.kv_size <= 0:
+            return 0
+        return max((self.capacity - self.total_memory_usage()) // self.kv_size, 0)
+
+    def _fit_for_insert(self, requested_tokens):
+        """Number of tokens that can actually be stored for an insert.
+
+        Bounds the radix cache like a real prefix cache (SGLang/vLLM): first
+        evict unlocked LRU leaves to make room, then return whatever capacity
+        remains. Returns 0 when the working set is fully locked (e.g. active
+        agentic sessions pin their prefixes via lock_ref), in which case the
+        caller skips the insert and the prefix is simply recomputed on the
+        next request — graceful degradation instead of a memory crash.
+        """
+        avail = self._avail_tokens()
+        if avail < requested_tokens:
+            self.evict(requested_tokens - avail)
+            avail = self._avail_tokens()
+        fit = min(requested_tokens, avail)
+        if fit < requested_tokens:
+            self.dropped_tokens += requested_tokens - fit
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "prefix cache full: storing %d/%d tokens (dropped %d, evictable=%d)",
+                    fit, requested_tokens, requested_tokens - fit,
+                    self.evictable_size(),
+                )
+        return fit
+
     ##### Public API #####
 
     def reset(self):
@@ -524,6 +562,26 @@ class RadixCache():
                 child_key = self.get_child_key_fn(key)
 
         if len(key): # remaining unmatched tokens
+            # Capacity bound: this cache must never grow past capacity, or the
+            # memory-model allocate() drained from our BlockStored events would
+            # raise RuntimeError. Evict unlocked LRU leaves for room, then only
+            # store as many whole pages as fit; skip the insert entirely when
+            # the working set is locked (backpressure, not a crash).
+            # Protect the matched path from eviction: `node` is about to gain
+            # a child, and evict() must not detach the node we attach to.
+            self.inc_lock_ref(node)
+            try:
+                fit = self._fit_for_insert(len(key))
+            finally:
+                self.dec_lock_ref(node)
+            if fit <= 0:
+                return total_prefix_length
+            if fit < len(key):
+                # Only store whole pages so the stored node stays page-matchable.
+                fit = fit // self.page_size * self.page_size
+                if fit <= 0:
+                    return total_prefix_length
+                key = key[:fit]
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
