@@ -3,10 +3,32 @@ from .utils import get_config
 from .block_pool import Device, BlockPool, PrefixCacheStats
 from .kv_cache_manager import TieredKVCacheManager, request_block_hashes
 from .logger import get_logger
+from .config_builder import get_device
+from .hbf_model import HBFAllocationKind, HBFMemory, is_hbf_location
 
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
 KB_TO_BYTE = 1024
+
+
+def _device_from_placement_loc(loc):
+    """Map a resolved placement location string to a Device enum.
+
+    Placement strings are produced by ``config_builder._mem_str``:
+    ``"LOCAL"`` (NPU), ``"REMOTE:{node}"`` (CPU), ``"CXL*"``, ``"HBF"``.
+    """
+    if loc is None:
+        return Device.CPU
+    upper = loc.upper()
+    if upper == "HBF":
+        return Device.HBF
+    if upper.startswith("REMOTE"):
+        return Device.CPU
+    if upper.startswith("CXL"):
+        return Device.CXL
+    if upper == "LOCAL" or upper.startswith("NPU"):
+        return Device.NPU
+    return Device.CPU
 
 # LMCache's default chunk size. A host offload tier stores whole chunks of this
 # many tokens, which must be a multiple of the NPU block size -- the tier keys on
@@ -26,7 +48,7 @@ class MemoryModel():
     an allocation that cannot be satisfied says so in the call that asks.
     """
 
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0, placement=None, hbf_mem=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -45,6 +67,15 @@ class MemoryModel():
         self.prefix_storage = prefix_storage
         self.npu_memory_utilization = npu_memory_utilization
 
+        self.placement = placement
+        self.hbf_memory = None
+        self.weight_residency_by_pp_rank = None
+        if hbf_mem is not None:
+            self.hbf_memory = HBFMemory(
+                num_stacks=hbf_mem["num_stacks"],
+                stack_capacity_gb=hbf_mem["stack_capacity_gb"],
+            )
+
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
@@ -62,12 +93,30 @@ class MemoryModel():
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
         self.weight = self.get_weight() # assume weight is loaded
-        if self.weight > self.npu_mem:
-            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.num_npus//GB_TO_BYTE}GB")
+        if self.hbf_memory is None:
+            # Preserve the exact upstream accounting path when HBF is absent.
+            self.hbm_weight = self.weight
+            self.hbf_weight = 0
+        else:
+            self.hbm_weight, self.hbf_weight = self._get_weight_residency()
+            if self.hbf_weight > self.hbf_memory.capacity_bytes:
+                raise RuntimeError(
+                    f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] "
+                    "HBF weight capacity exceeded: "
+                    f"required={self.hbf_weight} "
+                    f"available={self.hbf_memory.capacity_bytes}"
+                )
+            self.hbf_memory.allocate(self.hbf_weight, HBFAllocationKind.WEIGHT)
+        if self.hbm_weight > self.npu_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] "
+                "HBM weight capacity exceeded: "
+                f"required={self.hbm_weight} available={self.npu_mem}"
+            )
 
         # Non-KV bytes the instance holds outside the pools: model weights, plus
         # anything --enable-local-offloading or the PIM model loads explicitly.
-        self._npu_reserved = self.weight
+        self._npu_reserved = self.hbm_weight
         self._cpu_reserved = 0
 
         self._bytes_per_token = self.get_kv(1)              # per rank
@@ -79,7 +128,7 @@ class MemoryModel():
         # context, which the simulator cannot profile and does not model -- so
         # this capacity is an upper bound on vLLM's at the same utilization).
         requested = int(self.npu_mem * self.npu_memory_utilization)
-        kv_bytes = requested - self.weight
+        kv_bytes = requested - self.hbm_weight
         if kv_bytes < self._npu_bytes_per_block:
             raise RuntimeError(
                 f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: "
@@ -87,7 +136,7 @@ class MemoryModel():
                 f"{kv_bytes / MB_TO_BYTE:.2f}MB for the KV cache "
                 f"({requested / MB_TO_BYTE:.2f}MB requested of "
                 f"{self.npu_mem / MB_TO_BYTE:.2f}MB, minus "
-                f"{self.weight / MB_TO_BYTE:.2f}MB of weights), which is less "
+                f"{self.hbm_weight / MB_TO_BYTE:.2f}MB of weights), which is less "
                 f"than one {block_size}-token block "
                 f"({self._npu_bytes_per_block / MB_TO_BYTE:.2f}MB)"
             )
@@ -127,6 +176,27 @@ class MemoryModel():
         Its blocks hold ``LOWER_TIER_CHUNK_TOKENS`` tokens and are sized in
         full-cluster bytes, because a host copy holds every rank's shard.
         """
+        if prefix_storage == Device.HBF:
+            if self.enable_prefix_sharing and prefix_pool is not None:
+                raise RuntimeError(
+                    f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: "
+                    "HBF is per-GPU private; --enable-prefix-sharing with "
+                    "--prefix-storage HBF is not supported"
+                )
+            if self.hbf_memory is None:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}]: "
+                    "HBF prefix storage requires hbf_mem on the instance"
+                )
+            # HBF is attached per GPU, so the second-tier cache is per-rank
+            # (kv_size per-rank, and the pool keys on the NPU block_size), not
+            # the full-cluster CPU/CXL shared pool. GPU-local HBF uses the same
+            # per-rank byte scale as the NPU.
+            return build_hbf_pool(
+                self.hbf_memory, self.block_size, self._bytes_per_token,
+                node_id=self.node_id, instance_id=self.instance_id,
+            )
+
         if self.enable_prefix_sharing and prefix_pool is not None:
             if prefix_pool.block_size % self.block_size != 0:
                 raise RuntimeError(
@@ -204,6 +274,81 @@ class MemoryModel():
             block_weight += ffn2_w
         return block_weight
 
+    def _get_weight_residency(self):
+        """Return worst-rank HBM/HBF residency across all PP stages."""
+        if self.placement is None:
+            return self.weight, 0
+
+        tp = self.tp_size
+        ep = self.ep_size
+        fp = self.fp
+        pp = max(self.pp_size, 1)
+        stage_rows = []
+
+        for pp_rank in range(pp):
+            stage_hbm = 0
+            stage_hbf = 0
+
+            def add(layer_name, block_idx, parallel):
+                nonlocal stage_hbm, stage_hbf
+                _, weight_size, _ = calculate_sizes(
+                    self.model,
+                    layer_name,
+                    1,
+                    parallel=parallel,
+                    fp=fp,
+                )
+                location = get_device(
+                    self.placement,
+                    block_idx,
+                    layer_name,
+                    "weights",
+                )
+                if is_hbf_location(location):
+                    stage_hbf += weight_size
+                else:
+                    stage_hbm += weight_size
+
+            if pp_rank == 0:
+                add("embedding", None, tp)
+
+            block_start = pp_rank * self.n_layer // pp
+            block_end = (pp_rank + 1) * self.n_layer // pp
+            for block_idx in range(block_start, block_end):
+                add("layernorm", block_idx, tp)
+                add("qkv_proj", block_idx, tp)
+                if str(self.config.get("model_type", "")).startswith(
+                    "qwen3"
+                ):
+                    add("qk_norm", block_idx, tp)
+                add("o_proj", block_idx, tp)
+                add("layernorm", block_idx, tp)
+                if self.is_moe:
+                    add("moe", block_idx, ep)
+                else:
+                    add("gate_up_proj", block_idx, tp)
+                    add("down_proj", block_idx, tp)
+
+            if pp_rank == pp - 1:
+                add("final_layernorm", None, tp)
+                add("lm_head", None, tp)
+
+            stage_rows.append(
+                {
+                    "pp_rank": pp_rank,
+                    "block_start": block_start,
+                    "block_end": block_end,
+                    "hbm_weight_used_bytes": stage_hbm,
+                    "hbf_weight_used_bytes": stage_hbf,
+                }
+            )
+
+        self.weight_residency_by_pp_rank = stage_rows
+        return (
+            max(row["hbm_weight_used_bytes"] for row in stage_rows),
+            max(row["hbf_weight_used_bytes"] for row in stage_rows),
+        )
+
     # -------------------- KV sizing math --------------------
 
     def get_kv(self, seq):
@@ -235,18 +380,53 @@ class MemoryModel():
         return 2 * self.kv_dim * num_tokens * self.n_layer * self.kv_fp // self.tp_size
 
     def free_weight(self):
-        if self._npu_reserved - self.weight < 0:
+        if self._npu_reserved - self.hbm_weight < 0:
             raise RuntimeError(
-                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
+                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.hbm_weight / MB_TO_BYTE:.2f}MB "
                 f"but only {self._npu_reserved / MB_TO_BYTE:.2f}MB is used."
             )
         self.logger.info(
             "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
             self.npu_used / MB_TO_BYTE,
-            self.weight / MB_TO_BYTE,
-            (self.npu_used - self.weight) / MB_TO_BYTE,
+            self.hbm_weight / MB_TO_BYTE,
+            (self.npu_used - self.hbm_weight) / MB_TO_BYTE,
         )
-        self._npu_reserved -= self.weight
+        self._npu_reserved -= self.hbm_weight
+        if self.hbf_memory is not None:
+            self.hbf_memory.free(self.hbf_weight, HBFAllocationKind.WEIGHT)
+
+    # -------------------- HBF KV / placement resolution --------------------
+
+    def _require_hbf(self):
+        """Raise a clear error when a HBF KV operation is requested without hbf_mem."""
+        if self.hbf_memory is None:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] "
+                "HBF KV access requested but no hbf_mem is configured for this instance"
+            )
+
+    def kv_evict_device(self):
+        """Resolve the KV eviction target Device from placement kv_evict_loc."""
+        if self.placement is None:
+            return Device.CPU
+        loc = get_device(self.placement, None, None, "kv_evict_loc")
+        return _device_from_placement_loc(loc)
+
+    def kv_evict_uses_full_cluster_bytes(self):
+        """CPU eviction is tracked in full-cluster bytes; other tiers are per-rank."""
+        return self.kv_evict_device() == Device.CPU
+
+    def hbf_kv_used_bytes(self):
+        if self.hbf_memory is None:
+            return 0
+        return self.hbf_memory.used_by_kind(HBFAllocationKind.KV)
+
+    def hbf_kv_capacity_bytes(self):
+        if self.hbf_memory is None:
+            return 0
+        return self.hbf_memory.capacity_bytes - self.hbf_memory.used_by_kind(
+            HBFAllocationKind.WEIGHT
+        )
 
     # -------------------- byte-level view over the pools --------------------
 
@@ -296,6 +476,9 @@ class MemoryModel():
             self._cpu_reserved += size
         elif device == Device.CXL:
             self._cpu_reserved += size
+        elif device == Device.HBF:
+            self._require_hbf()
+            self.hbf_memory.allocate(size, HBFAllocationKind.KV)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate in unsupported device {device}")
 
@@ -314,6 +497,9 @@ class MemoryModel():
                     f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] CPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {self._cpu_reserved / MB_TO_BYTE:.2f}MB is reserved."
                 )
             self._cpu_reserved -= size
+        elif device == Device.HBF:
+            self._require_hbf()
+            self.hbf_memory.free(size, HBFAllocationKind.KV)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free in unsupported device {device}")
 
@@ -324,6 +510,11 @@ class MemoryModel():
             return self.cpu_mem - self.cpu_used >= size
         elif device == Device.CXL:
             return self.cxl_mem - self.cpu_used >= size
+        elif device == Device.HBF:
+            if self.enable_prefix_sharing and self.prefix_storage == Device.HBF:
+                return self.storage_pool.is_avail(size)
+            self._require_hbf()
+            return (self.hbf_kv_capacity_bytes() - self.hbf_kv_used_bytes()) >= size
         raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 
     # -------------------- prefix cache statistics --------------------
@@ -400,6 +591,31 @@ def build_prefix_pool(tier, capacity_bytes, npu_block_size, cluster_bytes_per_to
             f"({bytes_per_block / MB_TO_BYTE:.2f}MB)"
         )
     return BlockPool(tier, num_blocks, chunk, bytes_per_block,
+                     enable_caching=True, node_id=node_id, instance_id=instance_id)
+
+
+def build_hbf_pool(hbf_memory, npu_block_size, bytes_per_token,
+                   node_id=None, instance_id=None):
+    """A per-GPU HBF second-tier :class:`BlockPool`.
+
+    HBF is attached per GPU, so unlike the shared CPU/CXL prefix pool this tier
+    is per-rank: it keys on the NPU ``block_size`` and is sized in per-rank
+    bytes (``bytes_per_token``, exactly as the NPU pool). The pool draws its
+    capacity from ``hbf_memory.available_bytes`` -- whatever is left over after
+    the static weights have been placed.
+    """
+    bytes_per_block = bytes_per_token * npu_block_size
+    capacity = hbf_memory.capacity_bytes - hbf_memory.used_by_kind(
+        HBFAllocationKind.WEIGHT
+    )
+    num_blocks = int(capacity // bytes_per_block)
+    if num_blocks < 1:
+        raise RuntimeError(
+            f"[build_hbf_pool] HBF: {capacity / GB_TO_BYTE:.2f}GB is not "
+            f"enough for one {npu_block_size}-token block "
+            f"({bytes_per_block / MB_TO_BYTE:.2f}MB)"
+        )
+    return BlockPool(Device.HBF, num_blocks, npu_block_size, bytes_per_block,
                      enable_caching=True, node_id=node_id, instance_id=instance_id)
 
 

@@ -7,6 +7,7 @@ import shutil
 from .utils import get_config
 from .pim_model import PIMModel
 from .logger import get_logger
+from .hbf_model import is_hbf_location, parse_hbf_config
 
 class FlowStyleList(list): pass
 
@@ -203,10 +204,12 @@ def _resolve_dp_groups(all_instances):
                 # EP spans both dimensions (cross-instance ALLTOALL)
                 ep_dim = [True, True] if tp0 > 1 else [False, True]
 
-        for m in members:
+        for group_rank, m in enumerate(members):
             m["dp_group_size"] = dp_size
+            m["dp_group_rank"] = group_rank
             m["local_ep"] = local_ep
             m["ep_total"] = ep_total
+            m["ep_rank_offset"] = group_rank * local_ep
             m["tp_dim"] = tp_dim
             m["ep_dim"] = ep_dim
 
@@ -221,8 +224,10 @@ def _resolve_dp_groups(all_instances):
     for inst in all_instances:
         if inst.get("dp_group") is None:
             inst["dp_group_size"] = 1
+            inst["dp_group_rank"] = 0
             inst["local_ep"] = inst["ep_size"]
             inst["ep_total"] = inst["ep_size"]
+            inst["ep_rank_offset"] = 0
             inst["tp_dim"] = local_dim
             inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
 
@@ -458,6 +463,19 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             model_config = get_config(instance["model_name"])
             _resolve_parallelism(instance, model_config)
 
+            hbf_config = parse_hbf_config(instance.get("hbf_mem"))
+            if hbf_config is not None:
+                instance["hbf_mem"] = hbf_config.to_dict()
+                logger.info(
+                    "HBF configured for %s: %d stacks, %.2fGB per stack, "
+                    "%.2fGB total, performance source=%s",
+                    instance["model_name"],
+                    hbf_config.num_stacks,
+                    hbf_config.stack_capacity_gb,
+                    hbf_config.capacity_bytes / (1024 ** 3),
+                    hbf_config.performance["source"],
+                )
+
             instance["node_id"] = node_id
             instance["instance_id"] = inst_id
             inst2node_mapping[inst_id] = node_id
@@ -683,7 +701,12 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     _create_network_config(network_config_path, total_instances, link_bw, link_latency)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
-    _validate_memory_config(memory_config_path, placement, enable_local_offloading)
+    _validate_memory_config(
+        memory_config_path,
+        placement,
+        enable_local_offloading,
+        allow_hbf=any(instance.get("hbf_mem") for instance in total_instances),
+    )
 
     cluster = {
         "num_nodes": num_nodes,
@@ -739,7 +762,8 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
     return
 
 # Validate memory configuration against placement settings
-def _validate_memory_config(memory_config_path, placement, enable_local_offloading):
+def _validate_memory_config(memory_config_path, placement, enable_local_offloading,
+                            allow_hbf=False):
 
     # 1) Load memory_config
     try:
@@ -765,6 +789,8 @@ def _validate_memory_config(memory_config_path, placement, enable_local_offloadi
 
     def _ok(loc):
         """Allow LOCAL when local offloading is disabled; else must be in allowed set."""
+        if is_hbf_location(loc):
+            return allow_hbf
         loc_n = _norm(loc)
         if loc_n is None:
             return True
@@ -867,5 +893,9 @@ def _mem_str(loc, node_id):
         return f"REMOTE:{node_id}"
     elif loc.upper().startswith("CXL"):
         return loc.upper()
+    elif loc.upper() == "HBF":
+        return "HBF"
+    elif loc.upper().startswith("HBF:"):
+        raise ValueError("Per-stack HBF placement is not supported; use aggregate 'hbf'")
     else:
         raise ValueError(f"Unknown memory placement name '{loc}'")
