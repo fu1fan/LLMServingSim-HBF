@@ -76,6 +76,10 @@ class HBFPerformanceSource(ABC):
 
     source_name = "abstract"
     evidence_level = "unknown"
+    # When True, the weight-load cost is modeled by the ASTRA memory tier
+    # (a MEM_LOAD at HBF mem_bw/mem_latency) rather than folded into this
+    # source's returned latency. Mirrors how CXL weights are handled.
+    handles_weight_traffic = False
 
     @abstractmethod
     def latency_ns(self, query):
@@ -121,6 +125,54 @@ class ScaleHBFPerformanceSource(HBFPerformanceSource):
         return value
 
 
+class BandwidthHBFPerformanceSource(HBFPerformanceSource):
+    """Additive bandwidth model: the HBF weight-load cost is accounted for by
+    the ASTRA memory tier as ``weight_bytes / mem_bw + mem_latency``.
+
+    The operator latency is returned unchanged (the compute cost). This is the
+    analogue of the existing CXL path: the profiled baseline already bundles
+    an HBM weight-load approximation, and the incremental HBF cost is modeled
+    as a separate off-chip MEM_LOAD rather than a multiplier on the whole
+    operator. Because the weight size is fixed per layer while compute scales
+    with batch size, the per-token weight penalty shrinks as concurrency grows
+    (batch amortization) — in contrast to the flat 'scale' multiplier, which
+    grows the penalty with batch size.
+    """
+
+    source_name = "bandwidth"
+    evidence_level = "analytical-bandwidth-model"
+    handles_weight_traffic = True
+
+    def __init__(self, mem_bw, mem_latency):
+        if (
+            not isinstance(mem_bw, (int, float))
+            or isinstance(mem_bw, bool)
+            or not math.isfinite(mem_bw)
+            or mem_bw <= 0
+        ):
+            raise ValueError("HBF mem_bw must be a positive number (GB/s)")
+        if (
+            not isinstance(mem_latency, (int, float))
+            or isinstance(mem_latency, bool)
+            or not math.isfinite(mem_latency)
+            or mem_latency < 0
+        ):
+            raise ValueError("HBF mem_latency must be a non-negative number (ns)")
+        self.mem_bw = float(mem_bw)
+        self.mem_latency = float(mem_latency)
+
+    def latency_ns(self, query):
+        # Weight traffic is handled by ASTRA's HBF memory tier; the operator
+        # latency itself is unchanged (compute-only).
+        return query.baseline_latency_ns
+
+    def describe(self):
+        value = super().describe()
+        value["mem_bw"] = self.mem_bw
+        value["mem_latency"] = self.mem_latency
+        return value
+
+
 def build_hbf_performance_source(
     hbf_mem,
     model,
@@ -135,6 +187,11 @@ def build_hbf_performance_source(
     source = performance["source"]
     if source == "scale":
         return ScaleHBFPerformanceSource(performance["latency_scale"])
+    if source == "bandwidth":
+        return BandwidthHBFPerformanceSource(
+            hbf_mem.get("mem_bw", 0),
+            hbf_mem.get("mem_latency", 0),
+        )
     if source == "profile":
         return ProfileBundleHBFPerformanceSource(
             performance["profile_root"],

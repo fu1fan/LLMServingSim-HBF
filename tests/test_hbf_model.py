@@ -137,7 +137,7 @@ class HBFPlacementTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Per-stack"):
             _mem_str("hbf:0", 0)
 
-    def test_only_static_weights_may_use_hbf(self):
+    def test_weights_kv_and_evict_may_use_hbf(self):
         placement = [{
             "default": {
                 "weights": "HBF",
@@ -173,14 +173,16 @@ class HBFPlacementTest(unittest.TestCase):
                     allow_hbf=False,
                 )
 
+            # HBF is now a first-class tier for weights, KV residency, and KV
+            # eviction; all three are gated on allow_hbf but otherwise pass.
             placement[0]["default"]["kv_loc"] = "HBF"
-            with self.assertRaisesRegex(ValueError, "future offload"):
-                _validate_memory_config(
-                    path,
-                    placement,
-                    enable_local_offloading=False,
-                    allow_hbf=True,
-                )
+            placement[0]["default"]["kv_evict_loc"] = "HBF"
+            _validate_memory_config(
+                path,
+                placement,
+                enable_local_offloading=False,
+                allow_hbf=True,
+            )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,26 @@ class Device(Enum):
     CXL = 3
     HBF = 4
 
+
+def _device_from_placement_loc(loc):
+    """Map a resolved placement location string to a Device enum.
+
+    Placement strings are produced by ``config_builder._mem_str``:
+    ``"LOCAL"`` (NPU), ``"REMOTE:{node}"`` (CPU), ``"CXL*"``, ``"HBF"``.
+    """
+    if loc is None:
+        return Device.CPU
+    upper = loc.upper()
+    if upper == "HBF":
+        return Device.HBF
+    if upper.startswith("REMOTE"):
+        return Device.CPU
+    if upper.startswith("CXL"):
+        return Device.CXL
+    if upper == "LOCAL" or upper.startswith("NPU"):
+        return Device.NPU
+    return Device.CPU
+
 class MemoryModel():
     def __init__(
         self,
@@ -38,6 +58,7 @@ class MemoryModel():
         kv_cache_dtype='auto',
         placement=None,
         hbf_mem=None,
+        moe_hot_expert_frac=0.0,
     ):
         self.model = model
         self.node_id = node_id
@@ -56,6 +77,13 @@ class MemoryModel():
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
         self.placement = placement
+        if (
+            not isinstance(moe_hot_expert_frac, (int, float))
+            or isinstance(moe_hot_expert_frac, bool)
+            or not (0.0 <= moe_hot_expert_frac <= 1.0)
+        ):
+            raise ValueError("moe_hot_expert_frac must be in [0, 1]")
+        self.moe_hot_expert_frac = float(moe_hot_expert_frac)
         self.hbf_memory = None
         self.weight_residency_by_pp_rank = None
         if hbf_mem is not None:
@@ -133,17 +161,39 @@ class MemoryModel():
                     elif prefix_storage == Device.CXL:
                         device = "CXL"
                         prefix_cache_capacity = self.cxl_mem
+                    elif prefix_storage == Device.HBF:
+                        if self.hbf_memory is None:
+                            raise RuntimeError(
+                                f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}]: "
+                                "HBF prefix storage requires hbf_mem on the instance"
+                            )
+                        device = "HBF"
+                        # HBF is attached per GPU, so the second-tier cache is
+                        # per-rank (kv_size per-rank, page_size = block_size),
+                        # mirroring the NPU prefix cache semantics rather than
+                        # the shared CPU/CXL pool.
+                        prefix_cache_capacity = self.hbf_memory.available_bytes
                     else:
                         raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}]: Device {prefix_storage} is currently not supported as a second tier prefix cache storage")
                     # print("[instance {}] prefix_cache_capacity : {}".format(instance_id, prefix_cache_capacity // GB_TO_BYTE))
-                    self.second_tier_prefix_cache = RadixCache(device=device, 
-                                                    node_id=self.node_id,
-                                                    instance_id=self.instance_id,
-                                                    page_size=1,
-                                                    capacity=prefix_cache_capacity,
-                                                    kv_size=(one_token_kv_size * self.num_npus),
-                                                    enable_kv_cache_events=True,
-                                                    )
+                    if prefix_storage == Device.HBF:
+                        self.second_tier_prefix_cache = RadixCache(device=device,
+                                                        node_id=self.node_id,
+                                                        instance_id=self.instance_id,
+                                                        page_size=self.block_size,
+                                                        capacity=prefix_cache_capacity,
+                                                        kv_size=one_token_kv_size,
+                                                        enable_kv_cache_events=True,
+                                                        )
+                    else:
+                        self.second_tier_prefix_cache = RadixCache(device=device,
+                                                        node_id=self.node_id,
+                                                        instance_id=self.instance_id,
+                                                        page_size=1,
+                                                        capacity=prefix_cache_capacity,
+                                                        kv_size=(one_token_kv_size * self.num_npus),
+                                                        enable_kv_cache_events=True,
+                                                        )
                 
         # Hash id -> token length for corresponding prefix cache block
         self._npu_cache_hashtolen = {}
@@ -234,6 +284,33 @@ class MemoryModel():
                 else:
                     stage_hbm += weight_size
 
+            def add_moe(block_idx, ep):
+                """MoE weights with per-expert hot/cold residency split.
+
+                When the MoE layer's weight placement is HBF, only the cold
+                experts (1 - moe_hot_expert_frac) stay in HBF; hot experts and
+                the gate/router stay in HBM. When placed elsewhere, the full
+                lump sum goes to HBM (legacy behavior).
+                """
+                nonlocal stage_hbm, stage_hbf
+                location = get_device(
+                    self.placement, block_idx, "moe", "weights"
+                )
+                if not is_hbf_location(location):
+                    _, weight_size, _ = calculate_sizes(
+                        self.model, "moe", 1, parallel=ep, fp=fp
+                    )
+                    stage_hbm += weight_size
+                    return
+                hbm_bytes, hbf_bytes = split_moe_residency_bytes(
+                    self.model,
+                    ep,
+                    fp,
+                    self.moe_hot_expert_frac,
+                )
+                stage_hbm += hbm_bytes
+                stage_hbf += hbf_bytes
+
             if pp_rank == 0:
                 add("embedding", None, tp)
 
@@ -249,7 +326,7 @@ class MemoryModel():
                 add("o_proj", block_idx, tp)
                 add("layernorm", block_idx, tp)
                 if self.is_moe:
-                    add("moe", block_idx, ep)
+                    add_moe(block_idx, ep)
                 else:
                     add("gate_up_proj", block_idx, tp)
                     add("down_proj", block_idx, tp)
@@ -380,6 +457,37 @@ class MemoryModel():
             )
         return
 
+    def _require_hbf(self):
+        """Raise a clear error when a HBF KV operation is requested without hbf_mem."""
+        if self.hbf_memory is None:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] "
+                "HBF KV access requested but no hbf_mem is configured for this instance"
+            )
+
+    def kv_evict_device(self):
+        """Resolve the KV eviction target Device from placement kv_evict_loc."""
+        if self.placement is None:
+            return Device.CPU
+        loc = get_device(self.placement, None, None, "kv_evict_loc")
+        return _device_from_placement_loc(loc)
+
+    def kv_evict_uses_full_cluster_bytes(self):
+        """CPU eviction is tracked in full-cluster bytes; other tiers are per-rank."""
+        return self.kv_evict_device() == Device.CPU
+
+    def hbf_kv_used_bytes(self):
+        if self.hbf_memory is None:
+            return 0
+        return self.hbf_memory.used_by_kind(HBFAllocationKind.KV)
+
+    def hbf_kv_capacity_bytes(self):
+        if self.hbf_memory is None:
+            return 0
+        return self.hbf_memory.capacity_bytes - self.hbf_memory.used_by_kind(
+            HBFAllocationKind.WEIGHT
+        )
+
     # -------------------- Memory Management --------------------
     
     def allocate(self, size, device):
@@ -413,6 +521,9 @@ class MemoryModel():
                 self.cpu_used += size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.allocate(size)
+        elif device == Device.HBF:
+            self._require_hbf()
+            self.hbf_memory.allocate(size, HBFAllocationKind.KV)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
@@ -448,6 +559,9 @@ class MemoryModel():
                 self.cpu_used -= size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.free(size)
+        elif device == Device.HBF:
+            self._require_hbf()
+            self.hbf_memory.free(size, HBFAllocationKind.KV)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free KV cache in unsupported device {device}")
     
@@ -467,6 +581,13 @@ class MemoryModel():
                     return False 
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.is_avail(size)
+        elif device == Device.HBF:
+            if self.enable_prefix_sharing and self.prefix_storage == Device.HBF:
+                return self.second_tier_prefix_cache.is_avail(size)
+            self._require_hbf()
+            return (
+                self.hbf_kv_capacity_bytes() - self.hbf_kv_used_bytes()
+            ) >= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
     
@@ -488,6 +609,15 @@ class MemoryModel():
                     return 0
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.need_size(size)
+        elif device == Device.HBF:
+            if self.enable_prefix_sharing and self.prefix_storage == Device.HBF:
+                return self.second_tier_prefix_cache.need_size(size)
+            self._require_hbf()
+            needed = (
+                size
+                - (self.hbf_kv_capacity_bytes() - self.hbf_kv_used_bytes())
+            )
+            return needed if needed > 0 else 0
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 
@@ -497,7 +627,7 @@ class MemoryModel():
         
         if device == Device.NPU:
             return self.npu_prefix_cache.avail_size()
-        elif device == Device.CPU or device == Device.CXL:
+        elif device == Device.CPU or device == Device.CXL or device == Device.HBF:
             return self.second_tier_prefix_cache.avail_size()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get available size of prefix cache in unsupported device {device}")
@@ -518,7 +648,7 @@ class MemoryModel():
         
         if device == Device.NPU:
             return self.npu_prefix_cache.evictable_size() * self._bytes_per_token
-        elif device == Device.CPU or device == Device.CXL:
+        elif device == Device.CPU or device == Device.CXL or device == Device.HBF:
             return self.second_tier_prefix_cache.evictable_size() * self._bytes_per_token
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get evictable size of prefix cache in unsupported device {device}")
@@ -534,7 +664,7 @@ class MemoryModel():
             # print(f"[LOCK] req={req.id} lock_prefix node_id={node.id} lock_ref_BEFORE={node.lock_ref}")
             self.npu_prefix_cache.inc_lock_ref(req.npu_last_node)
             # print(f"[LOCK] req={req.id} lock_prefix node_id={node.id} lock_ref_AFTER={node.lock_ref}")
-        elif (device == Device.CPU or device == Device.CXL) and req.cpu_last_node is not None:
+        elif (device == Device.CPU or device == Device.CXL or device == Device.HBF) and req.cpu_last_node is not None:
             self.second_tier_prefix_cache.inc_lock_ref(req.cpu_last_node)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to lock prefix cache in unsupported device {device}")
@@ -552,6 +682,9 @@ class MemoryModel():
             req.npu_last_node = None
             req._prefix_locked = False
         elif device == Device.CPU and req.cpu_last_node is not None:
+            self.second_tier_prefix_cache.dec_lock_ref(req.cpu_last_node)
+            req.cpu_last_node = None
+        elif device == Device.HBF and req.cpu_last_node is not None:
             self.second_tier_prefix_cache.dec_lock_ref(req.cpu_last_node)
             req.cpu_last_node = None
         else:
@@ -578,7 +711,7 @@ class MemoryModel():
                 # print(f"cache_unfinished_req of req {req.id}")
                 # print(f"===============NPU PREFIX CAHCE of Instance[{self.instance_id}]=================")
                 self.npu_prefix_cache.pretty_print()
-        elif device == Device.CPU or device == Device.CXL:
+        elif device == Device.CPU or device == Device.CXL or device == Device.HBF:
             self.second_tier_prefix_cache.cache_unfinished_req(req)
             if self.logger.isEnabledFor(logging.DEBUG):
                 # print(f"cache_unfinished_req of req {req.id}")
@@ -616,7 +749,7 @@ class MemoryModel():
                 print(f"cache_finished_req of req {req.id}")
                 print(f"===============NPU PREFIX CACHE of Instance[{self.instance_id}]=================")
                 self.npu_prefix_cache.pretty_print()
-        elif device == Device.CPU or device == Device.CXL:
+        elif device == Device.CPU or device == Device.CXL or device == Device.HBF:
             self.second_tier_prefix_cache.cache_finished_req(req)
             if self.logger.isEnabledFor(logging.DEBUG):
                 # print(f"cache_finished_req of req {req.id}")
@@ -633,7 +766,7 @@ class MemoryModel():
 
         if device == Device.NPU:
             cache = self.npu_prefix_cache
-        elif device == Device.CPU:
+        elif device == Device.CPU or device == Device.CXL or device == Device.HBF:
             cache = self.second_tier_prefix_cache
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to evict prefix cache to unsupported device {device}")
@@ -696,7 +829,14 @@ class MemoryModel():
             return
         # free evictable prefix cache, if evictable_size != total_size there is locked prefix cache
         self.free(self.npu_prefix_cache.evictable_size() * self._bytes_per_token, Device.NPU)
-        if not self.enable_prefix_sharing and self.prefix_storage is not None:
+        # The HBF second-tier prefix cache is self-accounted by its own
+        # RadixCache (not bridged into hbf_memory), so there is nothing to
+        # free from the HBFMemory KV ledger at teardown.
+        if (
+            not self.enable_prefix_sharing
+            and self.prefix_storage is not None
+            and self.prefix_storage is not Device.HBF
+        ):
             self.free(self.second_tier_prefix_cache.evictable_size() * self._bytes_per_token * self.num_npus, self.prefix_storage)
     
     # Count load/unload events from prefix cache and update memory usage
@@ -809,6 +949,53 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
     # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
+
+
+def moe_gate_weight_bytes(model, fp):
+    """Replicated MoE router/gate weight bytes (accessed every token)."""
+    config = get_config(model)
+    n_embd = config['hidden_size']
+    num_local_experts = config.get(
+        "num_local_experts", config.get("num_experts", 1)
+    )
+    return n_embd * num_local_experts * fp
+
+
+def moe_per_expert_weight_bytes(model, fp):
+    """Per-expert MoE weight bytes: gate_up + gate + down (3 matrices)."""
+    config = get_config(model)
+    n_embd = config['hidden_size']
+    ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))
+    moe_ffn_dim = config.get("moe_intermediate_size", ffn_dim)
+    return 3 * n_embd * moe_ffn_dim * fp
+
+
+def moe_experts_per_rank(model, ep):
+    config = get_config(model)
+    num_local_experts = config.get(
+        "num_local_experts", config.get("num_experts", 1)
+    )
+    return max(1, int(num_local_experts) // max(1, int(ep)))
+
+
+def split_moe_residency_bytes(model, ep, fp, hot_expert_frac):
+    """Split per-rank MoE weight into (hbm_bytes, hbf_bytes) by hot/cold experts.
+
+    The gate/router weight is always counted as HBM (it is accessed on every
+    token regardless of routing). The remaining expert weights are partitioned:
+    ``hot_count = round(experts_per_rank * hot_expert_frac)`` experts stay in
+    HBM, the rest are cold and counted toward HBF. ``hot_expert_frac`` defaults
+    to 0.0 (all experts cold → full HBF offload; the gate stays in HBM).
+    """
+    gate = moe_gate_weight_bytes(model, fp)
+    per_expert = moe_per_expert_weight_bytes(model, fp)
+    experts_per_rank = moe_experts_per_rank(model, ep)
+    hot_count = int(round(experts_per_rank * hot_expert_frac))
+    hot_count = max(0, min(experts_per_rank, hot_count))
+    cold_count = experts_per_rank - hot_count
+    hbm = gate + hot_count * per_expert
+    hbf = cold_count * per_expert
+    return hbm, hbf
 
 
 # calculate the per-rank input, weight, output size of each layer

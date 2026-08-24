@@ -21,7 +21,7 @@ class Scheduler:
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
-                 placement=None, hbf_mem=None):
+                 placement=None, hbf_mem=None, moe_hot_expert_frac=0.0):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -54,6 +54,7 @@ class Scheduler:
             ep_size=ep_size, pp_size=pp_size,
             kv_cache_dtype=kv_cache_dtype, placement=placement,
             hbf_mem=hbf_mem,
+            moe_hot_expert_frac=moe_hot_expert_frac,
         )
 
         # logger
@@ -215,12 +216,20 @@ class Scheduler:
                 req_to_evict.evict = True
                 self.logger.info("Eviction of the request #%d", req_to_evict.id)
                 gen_req = gen_req[:-1]
-                # spill to cpu (host) memory. get_evict_kv returns per-rank
-                # bytes; cpu_used is tracked in full-cluster bytes (matches
-                # MemoryModel.apply_kv_cache_events convention), so scale by
-                # num_npus when crossing the NPU->CPU boundary.
+                # Spill to the configured KV eviction tier (placement
+                # kv_evict_loc, default CPU). get_evict_kv returns per-rank
+                # bytes; CPU accounting is full-cluster (matches
+                # MemoryModel.apply_kv_cache_events convention), while
+                # per-GPU tiers (HBF) are per-rank — scale only when the
+                # target tier is CPU.
+                evict_dev = self.memory.kv_evict_device()
                 self.memory.free(evicted_kv_size, Device.NPU)
-                self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
+                if self.memory.kv_evict_uses_full_cluster_bytes():
+                    self.memory.allocate(
+                        evicted_kv_size * self.num_npus, evict_dev
+                    )
+                else:
+                    self.memory.allocate(evicted_kv_size, evict_dev)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -255,11 +264,16 @@ class Scheduler:
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
 
-            # Reload evicted KV to NPU and remove the spilled copy from CPU.
-            # load_size is per-rank, cpu_used is full-cluster.
+            # Reload evicted KV to NPU and remove the spilled copy from the
+            # eviction tier. load_size is per-rank; CPU accounting is
+            # full-cluster while per-GPU tiers (HBF) are per-rank.
             if load_size > 0:
+                evict_dev = self.memory.kv_evict_device()
                 self.memory.allocate(load_size, Device.NPU)
-                self.memory.free(load_size * self.num_npus, Device.CPU)
+                if self.memory.kv_evict_uses_full_cluster_bytes():
+                    self.memory.free(load_size * self.num_npus, evict_dev)
+                else:
+                    self.memory.free(load_size, evict_dev)
             
             # ============ STEP 5: Build batch with lists ============
             total_len = 0
@@ -558,7 +572,7 @@ class Scheduler:
                     self.memory.prefix_match(req)
                     self.memory.lock_prefix(req, Device.NPU)
                     if self.prefix_storage is not None:
-                        self.memory.unlock_prefix(req, Device.CPU)
+                        self.memory.unlock_prefix(req, self.prefix_storage)
                     evict_load_size += self.memory.get_evict_kv(req)
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)

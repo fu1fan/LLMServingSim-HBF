@@ -20,6 +20,8 @@ class HBFConfig:
     num_stacks: int
     stack_capacity_gb: float
     performance: dict
+    mem_bw: float = 0.0
+    mem_latency: float = 0.0
 
     @property
     def capacity_bytes(self):
@@ -33,6 +35,8 @@ class HBFConfig:
             "num_stacks": self.num_stacks,
             "stack_capacity_gb": self.stack_capacity_gb,
             "mem_size": self.num_stacks * self.stack_capacity_gb,
+            "mem_bw": self.mem_bw,
+            "mem_latency": self.mem_latency,
             "performance": dict(self.performance),
         }
 
@@ -77,9 +81,9 @@ def parse_hbf_config(value):
     if not isinstance(performance, dict):
         raise TypeError("hbf_mem.performance must be an object")
     source = performance.get("source")
-    if source not in {"scale", "profile"}:
+    if source not in {"scale", "profile", "bandwidth"}:
         raise ValueError(
-            "hbf_mem.performance.source must be 'scale' or 'profile'"
+            "hbf_mem.performance.source must be 'scale', 'profile' or 'bandwidth'"
         )
     if source == "scale":
         latency_scale = performance.get("latency_scale")
@@ -92,18 +96,24 @@ def parse_hbf_config(value):
             raise ValueError(
                 "hbf_mem.performance.latency_scale must be positive"
             )
-    else:
+    elif source == "profile":
         for key in ("profile_root", "profile_hardware"):
             if not isinstance(performance.get(key), str) or not performance[key]:
                 raise ValueError(
                     f"hbf_mem.performance.{key} must be a non-empty string"
                 )
 
+    # Optional physical-medium parameters for the 'bandwidth' source.
+    mem_bw = _optional_positive_float(value.get("mem_bw"), "mem_bw", required=source == "bandwidth")
+    mem_latency = _optional_nonnegative_float(value.get("mem_latency"), "mem_latency")
+
     return HBFConfig(
         schema_version=schema_version,
         num_stacks=memory.num_stacks,
         stack_capacity_gb=memory.stack_capacity_gb,
         performance=dict(performance),
+        mem_bw=mem_bw,
+        mem_latency=mem_latency,
     )
 
 
@@ -111,9 +121,48 @@ def is_hbf_location(value):
     return isinstance(value, str) and value.upper() == "HBF"
 
 
-def lower_hbf_trace_location(value):
-    """Lower logical HBF placement to ASTRA's existing local-memory path."""
-    return "LOCAL" if is_hbf_location(value) else value
+def _optional_positive_float(value, name, required=False):
+    """Validate an optional positive float; returns 0.0 when absent (unless required)."""
+    if value is None:
+        if required:
+            raise ValueError(f"hbf_mem.{name} must be a positive number for the 'bandwidth' source")
+        return 0.0
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"hbf_mem.{name} must be a positive number")
+    return float(value)
+
+
+def _optional_nonnegative_float(value, name):
+    """Validate an optional non-negative float; returns 0.0 when absent."""
+    if value is None:
+        return 0.0
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"hbf_mem.{name} must be a non-negative number")
+    return float(value)
+
+
+def lower_hbf_trace_location(value, handles_weight_traffic=False):
+    """Lower logical HBF placement to the ASTRA memory-location string.
+
+    With ``handles_weight_traffic=True`` (the 'bandwidth' source) HBF is kept
+    as a first-class ``"HBF"`` location so ASTRA issues a MEM_LOAD/STORE and
+    models ``weight_bytes / mem_bw + mem_latency`` itself. Otherwise (flat
+    'scale' / 'profile' sources, which account for the penalty in Python) HBF
+    is lowered to ``"LOCAL"`` so no duplicate off-chip traffic is emitted.
+    """
+    if is_hbf_location(value):
+        return "HBF" if handles_weight_traffic else "LOCAL"
+    return value
 
 
 @dataclass

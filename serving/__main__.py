@@ -194,6 +194,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
+            "moe_hot_expert_frac": instance.get(
+                "moe_hot_expert_frac", args.moe_hot_expert_frac),
         })
     return runtime_configs
 
@@ -260,11 +262,14 @@ def main():
                         'matching vLLM v1 behavior (default: enabled). Use --no-enable-chunked-prefill to disable')
     parser.add_argument('--enable-prefix-sharing', action='store_true', default=False,
                         help='enable second-tier prefix cache pooling across instances within a node')
-    parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL'], default='None',
-                        help='storage medium for the second-tier prefix cache pool: None (NPU only), CPU, or CXL')
+    parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL', 'HBF'], default='None',
+                        help='storage medium for the second-tier prefix cache pool: None (NPU only), CPU, CXL, or HBF (per-GPU; sharing unsupported)')
     parser.add_argument('--enable-local-offloading', action='store_true', default=False,
                         help='enable weight offloading to local (NPU) memory. '
                         'Recommended to disable unless weight memory access is not counted in profiling')
+    parser.add_argument('--moe-hot-expert-frac', type=float, default=0.0,
+                        help='fraction of MoE experts kept resident in HBM (rest are cold and offloaded to HBF). '
+                        'Default 0.0 = all experts cold (full offload).')
     parser.add_argument('--enable-attn-offloading', action='store_true', default=False,
                         help='enable attention computation offloading to PIM (Processing-In-Memory) devices')
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', default=False,
@@ -408,6 +413,8 @@ def main():
         pool_device = Device.CPU
     elif prefix_storage == "CXL":
         pool_device = Device.CXL
+    elif prefix_storage == "HBF":
+        pool_device = Device.HBF
 
     if any_prefix_caching and enable_prefix_sharing and prefix_storage != 'None':
         num_prefix_pool = num_nodes
@@ -463,6 +470,14 @@ def main():
                 prefix_pool_inst_mapping = [0 for _ in range(num_instances)]
             else:
                 raise RuntimeError(f"Memory size for prefix storage type {prefix_storage} is invalid")
+        elif prefix_storage == 'HBF':
+            # HBF is attached per GPU, so a shared cross-instance prefix pool is
+            # not meaningful. Use --prefix-storage HBF WITHOUT
+            # --enable-prefix-sharing to get a per-instance HBF prefix cache.
+            raise NotImplementedError(
+                "Shared HBF prefix pool is unsupported; run --prefix-storage HBF "
+                "without --enable-prefix-sharing for per-GPU HBF prefix caching."
+            )
         else:
             raise NotImplementedError(f"Prefix storage type {prefix_storage} is not supported or memory size is invalid")
 
@@ -495,6 +510,7 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             placement=placement[instance_id],
             hbf_mem=instance.get("hbf_mem"),
+            moe_hot_expert_frac=inst_cfg["moe_hot_expert_frac"],
         ))
 
     # Controller for astra-sim process communication

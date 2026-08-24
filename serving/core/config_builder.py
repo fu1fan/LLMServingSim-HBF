@@ -517,6 +517,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         
         # Calculate the total number of NPUs and create a mapping for each instance
         npu_mem_enabled = False  # only one type of npu memory config is supported for now (latency & bandwidth)
+        hbf_mem_enabled = False  # only one type of hbf memory config is supported for now (bandwidth source)
 
         for idx, instance in enumerate(instances):
             npu_mem = instance.get("npu_mem")
@@ -547,6 +548,23 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                         "mem-latency": npu_mem["mem_latency"]
                     }
                 npu_mem_enabled = True
+
+            # Add HBF as a first-class ASTRA memory tier when the bandwidth
+            # source is used (weights are then emitted as "HBF" MEM_LOADs and
+            # ASTRA models weight_bytes/mem_bw + mem_latency). For scale/profile
+            # sources HBF is lowered to LOCAL and no tier is emitted.
+            hbf_mem = instance.get("hbf_mem")
+            if (
+                hbf_mem is not None
+                and hbf_mem.get("performance", {}).get("source") == "bandwidth"
+            ):
+                if not hbf_mem_enabled:
+                    memory_config["hbf_mem"] = {
+                        "memory-type": "PER_NPU_MEMORY_EXPANSION",
+                        "mem-bw": hbf_mem["mem_bw"],
+                        "mem-latency": hbf_mem["mem_latency"],
+                    }
+                    hbf_mem_enabled = True
 
             if pd_type not in ["prefill", "decode", None]:
                 raise ValueError(f"Invalid pd_type '{pd_type}' in instance {idx}. Must be 'prefill', 'decode', or omitted.")
@@ -762,11 +780,10 @@ def _validate_memory_config(
             return
         for kind in ("weights", "kv_loc", "kv_evict_loc"):
             if kind in entry and entry[kind] is not None:
-                if is_hbf_location(entry[kind]) and kind != "weights":
-                    raise ValueError(
-                        f"HBF {kind} is reserved for a future offload path "
-                        "and is not supported in the static-weight release."
-                    )
+                # HBF is now a first-class memory tier: weights, KV residency
+                # (kv_loc) and KV eviction target (kv_evict_loc) may all point
+                # at HBF. The `_ok` membership check below still gates HBF on
+                # `allow_hbf` (any instance configured with hbf_mem).
                 if not _ok(entry[kind]):
                     loc_n = _norm(entry[kind])
                     raise ValueError(
