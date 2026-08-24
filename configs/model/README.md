@@ -44,8 +44,10 @@ dimensional fields.
 | --- | --- | --- | --- | --- | --- | --- |
 | `meta-llama/Llama-3.1-8B.json` | dense | 32 | 4096 | 32 | 8 | — |
 | `meta-llama/Llama-3.1-70B.json` | dense | 80 | 8192 | 64 | 8 | — |
+| `meta-llama/Llama-3.1-405B-Instruct.json` | dense | 126 | 16384 | 128 | 8 | — |
 | `Qwen/Qwen3-32B.json` | dense | 64 | 5120 | 64 | 8 | — |
 | `Qwen/Qwen3-30B-A3B-Instruct-2507.json` | MoE | 48 | 2048 | 32 | 4 | 128E / top-8 |
+| `Qwen/Qwen3-235B-A22B.json` | MoE | 94 | 4096 | 64 | 4 | 128E / top-8 |
 | `mistralai/Mixtral-8x7B-v0.1.json` | MoE | 32 | 4096 | 32 | 8 | 8E / top-2 |
 | `microsoft/Phi-mini-MoE-instruct.json` | MoE | 32 | 4096 | 32 | 8 | 16E / top-2 |
 
