@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "hardware": "B200",
+  "imported_on": "2026-07-27",
+  "source_archive": "B200_profile.tar.gz",
+  "source_archive_sha256": "699b9bd2e57efb4532aefd5ca8abb66e45259466a616c112b93189dfa5c61cfb",
+  "source_bundle_path": "B200_profile/profiles/B200",
+  "producer": "LLMServingSim profiler v1.0.0 with vLLM v0.19.0",
+  "measurement_scope": "single-layer operator profiles with dummy model weights and TP shape emulation",
+  "evidence_level": "b200-operator-profile-backed",
+  "limitations": [
+    "The bundle is not an end-to-end serving measurement.",
+    "Tensor-parallel collective time is modeled separately by ASTRA-Sim.",
+    "The Qwen MoE operator table is queried using post-routing local token and activated-expert counts."
+  ]
+}

@@ -2,6 +2,7 @@ import bisect
 import json
 import random
 from .logger import get_logger
+from .run_paths import resolve_user_input_path
 
 
 class Router:
@@ -111,7 +112,7 @@ class Router:
         pending queue. Subsequent sub-requests are released dynamically
         via notify_request_completed() when predecessors finish.
         """
-        path = f'../{path}'
+        path = resolve_user_input_path(path)
         self._enable_prefix_caching = enable_prefix_caching
         self._is_init = is_init
         loaded_lines = 0

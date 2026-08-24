@@ -1815,12 +1815,12 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     # vllm: prepend the load / evict rows
     mem = []
     if load_size != 0:
-        load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+        load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(int(load_size)), 'LOCAL', '0', 'NONE', '0', 'NONE']
         mem.append(load)
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, load_size)
     if evict_size != 0:
-        evict = ["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+        evict = ["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(int(evict_size)), 'LOCAL', '0', 'NONE', '0', 'NONE']
         mem.append(evict)
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, evict_size)
