@@ -48,3 +48,10 @@ def build_run_paths(astra_sim, run_id, inputs_root=None):
 
 def input_path(inputs_root, *parts):
     return os.path.join(os.path.abspath(inputs_root), *parts)
+
+
+def resolve_user_input_path(path):
+    """Resolve a CLI input while the simulator is running in astra-sim/."""
+    if os.path.isabs(path):
+        return path
+    return os.path.join("..", path)

@@ -295,6 +295,13 @@ class BlockPool:
             return False
         if block_hash in self.cached_block_hash_to_block:
             return False
+        if self.get_num_free_blocks() < 1:
+            # Capacity bound (backpressure): a full tier must degrade to
+            # graceful drop rather than raise. The write-through is off the
+            # critical path -- the data still lives on the NPU, so skipping the
+            # copy costs a later recompute, never a RuntimeError. This mirrors
+            # the radix-tree capacity-bounded insert the fork added.
+            return False
         block = self.get_new_blocks(1)[0]
         block.block_hash = block_hash
         self.cached_block_hash_to_block[block_hash] = block
