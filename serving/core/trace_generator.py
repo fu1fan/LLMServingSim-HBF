@@ -1031,18 +1031,11 @@ def _apply_hbf_performance(
     return ctx.hbf_performance_source.latency_ns(query)
 
 
-def _hbf_handles_weight_traffic(ctx):
-    """Whether HBF weights are modeled as ASTRA off-chip traffic (bandwidth source)."""
-    return bool(
-        ctx.hbf_performance_source is not None
-        and ctx.hbf_performance_source.handles_weight_traffic
+def _counts_as_dram_weight_traffic(weight_location):
+    return (
+        weight_location != "LOCAL"
+        and not is_hbf_location(weight_location)
     )
-
-
-def _counts_as_dram_weight_traffic(weight_location, hbf_counts=False):
-    if is_hbf_location(weight_location):
-        return hbf_counts
-    return weight_location != "LOCAL"
 
 
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
@@ -1088,19 +1081,13 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         wt,
         wt_loc,
     )
-    trace_wt_loc = lower_hbf_trace_location(
-        wt_loc,
-        handles_weight_traffic=_hbf_handles_weight_traffic(ctx),
-    )
+    trace_wt_loc = lower_hbf_trace_location(wt_loc)
 
     lines.append(formatter(layer_name, str(latency_ns), input_loc, str(inp), trace_wt_loc, str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
 
     if power_acc is not None:
         power_acc.npu_latencies_ns.append(latency_ns)
-        if _counts_as_dram_weight_traffic(
-            wt_loc,
-            hbf_counts=_hbf_handles_weight_traffic(ctx),
-        ):
+        if _counts_as_dram_weight_traffic(wt_loc):
             power_acc.dram_weight_bytes += wt
         if comm_size > 0:
             collective = comm_type.split(':', 1)[0].lower()
@@ -1251,16 +1238,10 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
             lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
-                lower_hbf_trace_location(
-                    wt_loc,
-                    handles_weight_traffic=_hbf_handles_weight_traffic(ctx),
-                ), str(rank_wt),
+                lower_hbf_trace_location(wt_loc), str(rank_wt),
                 'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
 
-            if power_acc is not None and _counts_as_dram_weight_traffic(
-                wt_loc,
-                hbf_counts=_hbf_handles_weight_traffic(ctx),
-            ):
+            if power_acc is not None and _counts_as_dram_weight_traffic(wt_loc):
                 power_acc.dram_weight_bytes += rank_wt
 
     # Power: all local GPUs are active for the duration of the slowest rank
@@ -1454,10 +1435,7 @@ def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
             weight_location = get_device(
                 ctx.placement, None, layer_name, "weights"
             )
-            if _counts_as_dram_weight_traffic(
-                weight_location,
-                hbf_counts=_hbf_handles_weight_traffic(ctx),
-            ):
+            if _counts_as_dram_weight_traffic(weight_location):
                 _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
@@ -1500,10 +1478,7 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
             weight_location = get_device(
                 ctx.placement, None, layer_name, "weights"
             )
-            if _counts_as_dram_weight_traffic(
-                weight_location,
-                hbf_counts=_hbf_handles_weight_traffic(ctx),
-            ):
+            if _counts_as_dram_weight_traffic(weight_location):
                 _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 

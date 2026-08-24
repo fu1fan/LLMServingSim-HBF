@@ -20,11 +20,7 @@ def _placement(weight_location="HBF", kv_evict_loc="HBF"):
 
 
 def _hbf_config(stack_capacity_gb=512, source="scale"):
-    performance = (
-        {"source": "scale", "latency_scale": 1.0}
-        if source == "scale"
-        else {"source": "bandwidth"}
-    )
+    performance = {"source": "scale", "latency_scale": 1.0}
     config = {
         "schema_version": 1,
         "num_stacks": 8,
@@ -32,9 +28,6 @@ def _hbf_config(stack_capacity_gb=512, source="scale"):
         "mem_size": 8 * stack_capacity_gb,
         "performance": performance,
     }
-    if source == "bandwidth":
-        config["mem_bw"] = 64
-        config["mem_latency"] = 500
     return config
 
 

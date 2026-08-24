@@ -58,7 +58,6 @@ class MemoryModel():
         kv_cache_dtype='auto',
         placement=None,
         hbf_mem=None,
-        moe_hot_expert_frac=0.0,
     ):
         self.model = model
         self.node_id = node_id
@@ -77,13 +76,6 @@ class MemoryModel():
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
         self.placement = placement
-        if (
-            not isinstance(moe_hot_expert_frac, (int, float))
-            or isinstance(moe_hot_expert_frac, bool)
-            or not (0.0 <= moe_hot_expert_frac <= 1.0)
-        ):
-            raise ValueError("moe_hot_expert_frac must be in [0, 1]")
-        self.moe_hot_expert_frac = float(moe_hot_expert_frac)
         self.hbf_memory = None
         self.weight_residency_by_pp_rank = None
         if hbf_mem is not None:
@@ -284,33 +276,6 @@ class MemoryModel():
                 else:
                     stage_hbm += weight_size
 
-            def add_moe(block_idx, ep):
-                """MoE weights with per-expert hot/cold residency split.
-
-                When the MoE layer's weight placement is HBF, only the cold
-                experts (1 - moe_hot_expert_frac) stay in HBF; hot experts and
-                the gate/router stay in HBM. When placed elsewhere, the full
-                lump sum goes to HBM (legacy behavior).
-                """
-                nonlocal stage_hbm, stage_hbf
-                location = get_device(
-                    self.placement, block_idx, "moe", "weights"
-                )
-                if not is_hbf_location(location):
-                    _, weight_size, _ = calculate_sizes(
-                        self.model, "moe", 1, parallel=ep, fp=fp
-                    )
-                    stage_hbm += weight_size
-                    return
-                hbm_bytes, hbf_bytes = split_moe_residency_bytes(
-                    self.model,
-                    ep,
-                    fp,
-                    self.moe_hot_expert_frac,
-                )
-                stage_hbm += hbm_bytes
-                stage_hbf += hbf_bytes
-
             if pp_rank == 0:
                 add("embedding", None, tp)
 
@@ -326,7 +291,7 @@ class MemoryModel():
                 add("o_proj", block_idx, tp)
                 add("layernorm", block_idx, tp)
                 if self.is_moe:
-                    add_moe(block_idx, ep)
+                    add("moe", block_idx, ep)
                 else:
                     add("gate_up_proj", block_idx, tp)
                     add("down_proj", block_idx, tp)
@@ -949,53 +914,6 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
     # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
-
-
-def moe_gate_weight_bytes(model, fp):
-    """Replicated MoE router/gate weight bytes (accessed every token)."""
-    config = get_config(model)
-    n_embd = config['hidden_size']
-    num_local_experts = config.get(
-        "num_local_experts", config.get("num_experts", 1)
-    )
-    return n_embd * num_local_experts * fp
-
-
-def moe_per_expert_weight_bytes(model, fp):
-    """Per-expert MoE weight bytes: gate_up + gate + down (3 matrices)."""
-    config = get_config(model)
-    n_embd = config['hidden_size']
-    ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))
-    moe_ffn_dim = config.get("moe_intermediate_size", ffn_dim)
-    return 3 * n_embd * moe_ffn_dim * fp
-
-
-def moe_experts_per_rank(model, ep):
-    config = get_config(model)
-    num_local_experts = config.get(
-        "num_local_experts", config.get("num_experts", 1)
-    )
-    return max(1, int(num_local_experts) // max(1, int(ep)))
-
-
-def split_moe_residency_bytes(model, ep, fp, hot_expert_frac):
-    """Split per-rank MoE weight into (hbm_bytes, hbf_bytes) by hot/cold experts.
-
-    The gate/router weight is always counted as HBM (it is accessed on every
-    token regardless of routing). The remaining expert weights are partitioned:
-    ``hot_count = round(experts_per_rank * hot_expert_frac)`` experts stay in
-    HBM, the rest are cold and counted toward HBF. ``hot_expert_frac`` defaults
-    to 0.0 (all experts cold → full HBF offload; the gate stays in HBM).
-    """
-    gate = moe_gate_weight_bytes(model, fp)
-    per_expert = moe_per_expert_weight_bytes(model, fp)
-    experts_per_rank = moe_experts_per_rank(model, ep)
-    hot_count = int(round(experts_per_rank * hot_expert_frac))
-    hot_count = max(0, min(experts_per_rank, hot_count))
-    cold_count = experts_per_rank - hot_count
-    hbm = gate + hot_count * per_expert
-    hbf = cold_count * per_expert
-    return hbm, hbf
 
 
 # calculate the per-rank input, weight, output size of each layer

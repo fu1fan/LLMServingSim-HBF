@@ -21,7 +21,7 @@ class Scheduler:
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
-                 placement=None, hbf_mem=None, moe_hot_expert_frac=0.0):
+                 placement=None, hbf_mem=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -54,7 +54,6 @@ class Scheduler:
             ep_size=ep_size, pp_size=pp_size,
             kv_cache_dtype=kv_cache_dtype, placement=placement,
             hbf_mem=hbf_mem,
-            moe_hot_expert_frac=moe_hot_expert_frac,
         )
 
         # logger

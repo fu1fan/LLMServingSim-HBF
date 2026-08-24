@@ -18,8 +18,6 @@ def build_hbf_runtime_summary(instances, schedulers, num_devices, run_id):
             evidence_level = "sensitivity-analysis"
         elif source == "profile":
             evidence_level = "external-simulator-backed"
-        elif source == "bandwidth":
-            evidence_level = "analytical-bandwidth-model"
         memory_rows.append(
             {
                 "instance_id": instance_id,
@@ -45,8 +43,6 @@ def build_hbf_runtime_summary(instances, schedulers, num_devices, run_id):
                 ),
                 "timing_source": source,
                 "latency_scale": performance.get("latency_scale"),
-                "mem_bw": (hbf_mem or {}).get("mem_bw"),
-                "mem_latency": (hbf_mem or {}).get("mem_latency"),
                 "profile_root": performance.get("profile_root"),
                 "profile_hardware": performance.get("profile_hardware"),
                 "evidence_level": evidence_level,

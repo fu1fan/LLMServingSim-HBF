@@ -194,8 +194,6 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
-            "moe_hot_expert_frac": instance.get(
-                "moe_hot_expert_frac", args.moe_hot_expert_frac),
         })
     return runtime_configs
 
@@ -267,9 +265,6 @@ def main():
     parser.add_argument('--enable-local-offloading', action='store_true', default=False,
                         help='enable weight offloading to local (NPU) memory. '
                         'Recommended to disable unless weight memory access is not counted in profiling')
-    parser.add_argument('--moe-hot-expert-frac', type=float, default=0.0,
-                        help='fraction of MoE experts kept resident in HBM (rest are cold and offloaded to HBF). '
-                        'Default 0.0 = all experts cold (full offload).')
     parser.add_argument('--enable-attn-offloading', action='store_true', default=False,
                         help='enable attention computation offloading to PIM (Processing-In-Memory) devices')
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', default=False,
@@ -510,7 +505,6 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             placement=placement[instance_id],
             hbf_mem=instance.get("hbf_mem"),
-            moe_hot_expert_frac=inst_cfg["moe_hot_expert_frac"],
         ))
 
     # Controller for astra-sim process communication
