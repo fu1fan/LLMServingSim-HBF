@@ -1,0 +1,45 @@
+{
+  "num_nodes": 1,
+  "link_bw": 1800,
+  "link_latency": 0,
+  "nodes": [
+    {
+      "num_instances": 1,
+      "cpu_mem": {
+        "mem_size": 1024,
+        "mem_bw": 512,
+        "mem_latency": 0
+      },
+      "instances": [
+        {
+          "model_name": "meta-llama/Llama-3.1-405B-Instruct",
+          "hardware": "B200",
+          "npu_mem": {
+            "mem_size": 180,
+            "mem_bw": 8000,
+            "mem_latency": 0
+          },
+          "hbf_mem": {
+            "schema_version": 1,
+            "num_stacks": 8,
+            "stack_capacity_gb": 512,
+            "performance": {
+              "source": "scale",
+              "latency_scale": 1.0
+            }
+          },
+          "placement": {
+            "default": {
+              "weights": "hbf",
+              "kv_loc": "npu",
+              "kv_evict_loc": "cpu"
+            }
+          },
+          "num_npus": 8,
+          "tp_size": 8,
+          "pd_type": null
+        }
+      ]
+    }
+  ]
+}

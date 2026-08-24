@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "experiment_id": "hbf-parallel-modes-v1",
+  "hardware": "B200",
+  "dtype": "bfloat16",
+  "profiles": {
+    "evidence_level": "b200-operator-profile-backed",
+    "root": "profiler/perf/B200",
+    "provenance": "profiler/perf/B200/PROVENANCE.json"
+  },
+  "memory": {
+    "hbm_gib_per_gpu": 180,
+    "hbm_bandwidth_gb_s": 8000,
+    "hbf_stacks_per_gpu": 8,
+    "hbf_stack_capacity_gib": 512
+  },
+  "hbf_scales": [1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.5, 10.0],
+  "workloads": [
+    {
+      "id": "p1024-g128",
+      "path": "workloads/hbf-saturated-1024-128-300.jsonl"
+    },
+    {
+      "id": "p2048-g512",
+      "path": "workloads/hbf-saturated-2048-512-300.jsonl"
+    },
+    {
+      "id": "p2048-g2048",
+      "path": "workloads/hbf-saturated-2048-2048-300.jsonl"
+    }
+  ],
+  "routing": {
+    "custom_profile": "configs/routing/qwen3_public_calibrated_v1.json",
+    "main_seed": 42,
+    "mapping_seeds": [17, 42, 101, 2027, 4096],
+    "evidence": {
+      "BALANCED": "balanced-ideal-routing",
+      "CUSTOM": "public-stat-calibrated-synthetic-routing",
+      "RAND": "synthetic-uniform-routing"
+    }
+  },
+  "network_scenarios": {
+    "optimistic": {
+      "intra_bw_gb_s": 1800,
+      "intra_latency_ns": 0,
+      "inter_bw_gb_s": 50,
+      "inter_latency_ns": 5000
+    },
+    "central": {
+      "intra_bw_gb_s": 1800,
+      "intra_latency_ns": 500,
+      "inter_bw_gb_s": 50,
+      "inter_latency_ns": 10000
+    },
+    "pessimistic": {
+      "intra_bw_gb_s": 900,
+      "intra_latency_ns": 2000,
+      "inter_bw_gb_s": 25,
+      "inter_latency_ns": 20000
+    }
+  },
+  "models": [
+    {
+      "id": "llama405b",
+      "model_name": "meta-llama/Llama-3.1-405B-Instruct",
+      "kind": "dense",
+      "routing_policies": ["BALANCED"],
+      "topologies": [
+        {"id": "tp1", "family": "tp", "replicas": 1, "tp": 1, "pp": 1},
+        {"id": "tp2", "family": "tp", "replicas": 1, "tp": 2, "pp": 1},
+        {"id": "tp4", "family": "tp", "replicas": 1, "tp": 4, "pp": 1},
+        {"id": "tp8", "family": "tp", "replicas": 1, "tp": 8, "pp": 1},
+        {"id": "pp2", "family": "pp", "replicas": 1, "tp": 1, "pp": 2},
+        {"id": "pp4", "family": "pp", "replicas": 1, "tp": 1, "pp": 4},
+        {"id": "pp8", "family": "pp", "replicas": 1, "tp": 1, "pp": 8},
+        {"id": "r2", "family": "dp", "replicas": 2, "tp": 1, "pp": 1},
+        {"id": "r4", "family": "dp", "replicas": 4, "tp": 1, "pp": 1},
+        {"id": "r8", "family": "dp", "replicas": 8, "tp": 1, "pp": 1},
+        {"id": "r16", "family": "dp", "replicas": 16, "tp": 1, "pp": 1},
+        {"id": "tp2-pp2", "family": "tp-pp", "replicas": 1, "tp": 2, "pp": 2},
+        {"id": "tp4-pp2", "family": "tp-pp", "replicas": 1, "tp": 4, "pp": 2},
+        {"id": "r2-tp2", "family": "dp-tp", "replicas": 2, "tp": 2, "pp": 1},
+        {"id": "r2-tp4", "family": "dp-tp", "replicas": 2, "tp": 4, "pp": 1},
+        {"id": "r2-tp8", "family": "dp-tp", "replicas": 2, "tp": 8, "pp": 1},
+        {"id": "r2-pp2", "family": "dp-pp", "replicas": 2, "tp": 1, "pp": 2},
+        {"id": "r2-pp4", "family": "dp-pp", "replicas": 2, "tp": 1, "pp": 4},
+        {"id": "r2-pp8", "family": "dp-pp", "replicas": 2, "tp": 1, "pp": 8},
+        {"id": "r2-tp2-pp2", "family": "dp-tp-pp", "replicas": 2, "tp": 2, "pp": 2},
+        {"id": "r2-tp4-pp2", "family": "dp-tp-pp", "replicas": 2, "tp": 4, "pp": 2}
+      ],
+      "anchors": [
+        "tp1", "tp8", "pp8", "r8", "tp4-pp2",
+        "r2-tp4", "r2-pp4", "r2-tp2-pp2"
+      ],
+      "network_representatives": ["tp8", "pp8", "tp4-pp2"]
+    },
+    {
+      "id": "qwen235b",
+      "model_name": "Qwen/Qwen3-235B-A22B",
+      "kind": "moe",
+      "routing_policies": ["BALANCED", "CUSTOM"],
+      "topologies": [
+        {"id": "tp1-ep1", "family": "tp-ep", "replicas": 1, "tp": 1, "pp": 1, "ep": 1},
+        {"id": "tp2-ep2", "family": "tp-ep", "replicas": 1, "tp": 2, "pp": 1, "ep": 2},
+        {"id": "tp4-ep4", "family": "tp-ep", "replicas": 1, "tp": 4, "pp": 1, "ep": 4},
+        {"id": "pp2", "family": "pp", "replicas": 1, "tp": 1, "pp": 2, "ep": 1},
+        {"id": "pp4", "family": "pp", "replicas": 1, "tp": 1, "pp": 4, "ep": 1},
+        {"id": "pp8", "family": "pp", "replicas": 1, "tp": 1, "pp": 8, "ep": 1},
+        {"id": "r2", "family": "dp", "replicas": 2, "tp": 1, "pp": 1, "ep": 1},
+        {"id": "r4", "family": "dp", "replicas": 4, "tp": 1, "pp": 1, "ep": 1},
+        {"id": "r8", "family": "dp", "replicas": 8, "tp": 1, "pp": 1, "ep": 1},
+        {"id": "r16", "family": "dp", "replicas": 16, "tp": 1, "pp": 1, "ep": 1},
+        {"id": "tp2-ep2-pp2", "family": "tp-ep-pp", "replicas": 1, "tp": 2, "pp": 2, "ep": 2},
+        {"id": "tp4-ep4-pp2", "family": "tp-ep-pp", "replicas": 1, "tp": 4, "pp": 2, "ep": 4},
+        {"id": "r2-tp2-ep2", "family": "dp-tp-ep", "replicas": 2, "tp": 2, "pp": 1, "ep": 2},
+        {"id": "r2-tp4-ep4", "family": "dp-tp-ep", "replicas": 2, "tp": 4, "pp": 1, "ep": 4},
+        {"id": "r4-tp4-ep4", "family": "dp-tp-ep", "replicas": 4, "tp": 4, "pp": 1, "ep": 4},
+        {"id": "r2-pp2", "family": "dp-pp", "replicas": 2, "tp": 1, "pp": 2, "ep": 1},
+        {"id": "r2-pp4", "family": "dp-pp", "replicas": 2, "tp": 1, "pp": 4, "ep": 1},
+        {"id": "r2-pp8", "family": "dp-pp", "replicas": 2, "tp": 1, "pp": 8, "ep": 1},
+        {"id": "r2-tp2-ep2-pp2", "family": "dp-tp-ep-pp", "replicas": 2, "tp": 2, "pp": 2, "ep": 2},
+        {"id": "r2-tp4-ep4-pp2", "family": "dp-tp-ep-pp", "replicas": 2, "tp": 4, "pp": 2, "ep": 4},
+        {"id": "dpg2-tp1-ep2", "family": "dpg-ep", "dp_group_size": 2, "tp": 1, "pp": 1, "ep": 2},
+        {"id": "dpg4-tp1-ep4", "family": "dpg-ep", "dp_group_size": 4, "tp": 1, "pp": 1, "ep": 4},
+        {"id": "dpg2-tp2-ep4", "family": "dpg-tp-ep", "dp_group_size": 2, "tp": 2, "pp": 1, "ep": 4},
+        {"id": "dpg8-tp1-ep8", "family": "dpg-ep", "dp_group_size": 8, "tp": 1, "pp": 1, "ep": 8},
+        {"id": "dpg2-tp4-ep8", "family": "dpg-tp-ep", "dp_group_size": 2, "tp": 4, "pp": 1, "ep": 8},
+        {"id": "dpg4-tp4-ep16", "family": "dpg-tp-ep", "dp_group_size": 4, "tp": 4, "pp": 1, "ep": 16}
+      ],
+      "anchors": [
+        "tp1-ep1", "tp4-ep4", "pp8", "r8", "tp4-ep4-pp2",
+        "r2-tp4-ep4", "r2-pp4", "r2-tp2-ep2-pp2",
+        "dpg8-tp1-ep8", "dpg2-tp4-ep8"
+      ],
+      "routing_seed_representatives": [
+        "tp4-ep4", "dpg2-tp4-ep8", "dpg4-tp4-ep16"
+      ],
+      "rand_representatives": ["tp4-ep4", "dpg2-tp4-ep8"],
+      "network_representatives": [
+        "tp4-ep4", "tp4-ep4-pp2",
+        "dpg2-tp4-ep8", "dpg4-tp4-ep16"
+      ]
+    }
+  ],
+  "selection": {
+    "device_budgets": [4, 8, 16],
+    "throughput_floor_ratio": 0.95,
+    "primary_metric": "generation_throughput_tok_s_per_device",
+    "latency_metric": "ttft_ms_p99",
+    "latency_tiebreaker": "tpot_ms_p99"
+  },
+  "excluded": [
+    "expert tensor parallelism",
+    "single-instance EP less than TP",
+    "DP-group combined with PP",
+    "single-model-group PP16",
+    "domain-conditioned or token-content-conditioned CUSTOM routing"
+  ]
+}
