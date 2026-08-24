@@ -1,92 +1,88 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/static/img/llmservingsim_full_primary_dark_transparent.png">
-    <img alt="LLMServingSim" src="docs/static/img/llmservingsim_full_primary_transparent.png" width="70%">
-  </picture>
-</p>
+# LLMServingSim (HBF fork)
 
-<h3 align="center">
-A Unified Simulator for Heterogeneous and Disaggregated LLM Serving Infrastructure
-</h3>
+This is an experimental fork of
+[`casys-kaist/LLMServingSim`](https://github.com/casys-kaist/LLMServingSim) hosting
+the **HBF (Host-Based Flash / CXL-style host-attached flash) weight-residency**
+extensions used by the HBFServingSim research repo.
 
-<p align="center">
-| <a href="https://llmservingsim.ai"><b>Website</b></a> | <a href="https://llmservingsim.ai/docs/getting-started/overview"><b>Documentation</b></a> | <a href="https://llmservingsim.ai/docs/contributor/welcome"><b>Contribute</b></a> | <a href="https://llmservingsim.ai/contact"><b>Contact</b></a> | <a href="https://llmservingsim.ai/changelog"><b>Changelog</b></a> |
-</p>
+> Upstream's own README (LLMServingSim website, Docker workflow, etc.) does **not**
+> apply here. This fork is consumed directly as a submodule and is prepared with a
+> plain Python environment, not the upstream Docker container.
 
-We have built an LLMServingSim website to help you get started with the simulator. Please visit [llmservingsim.ai](https://llmservingsim.ai) for documentation, contribution guides, and team contact info.
+## What this fork adds relative to upstream `main`
 
-## About
+Baseline upstream: `casys-kaist/LLMServingSim@main` (`c84e58b`). `hbf-main` is **45
+commits ahead**.
 
-LLMServingSim is a cycle-level simulator for LLM serving infrastructure. It pairs a Python frontend that mirrors vLLM's continuous-batching scheduler with the ASTRA-Sim C++ analytical network backend, and drives both from per-hardware latency data captured by a vLLM-based layerwise profiler. The result is a unified environment for studying heterogeneous accelerators, disaggregated memory tiers (CPU / CXL / PIM), MoE routing, and multi-instance parallelism (TP / PP / EP / DP) end-to-end.
+- **HBF weight residency (parameter-driven)** — `serving/core/hbf_model.py`,
+  `hbf_performance.py`, `hbf_summary.py`, `memory_model.py`, `config_builder.py`,
+  `trace_generator.py`. Model static weights can be placed in HBF (`"weights": "hbf"`)
+  at a per-operator latency scale `k`, freeing HBM for KV cache.
+- **KV generalization** — `memory_model.py`, `scheduler.py`, `config_builder.py`.
+  KV eviction target (`kv_evict_loc`) may be HBF with correct per-rank vs
+  full-cluster byte accounting; `--prefix-storage HBF` for per-GPU prefix caching.
+- **KV backpressure fix (generic, upstream-portable)** — `serving/core/radix_tree.py`
+  bounds prefix-cache inserts so a locked working set degrades gracefully instead of
+  crashing; `trace_generator.py` emits integer `kv_load`/`kv_evict` sizes.
+- **Tooling & data** — `scripts/hbf_parallel_matrix.py`, `hbf_sweep.py`;
+  `configs/cluster/hbf_*`; `configs/experiments/hbf_parallel_modes_v1.json`;
+  `profiler/perf/B200/`; `tests/test_hbf_*.py`.
 
-## Getting Started
+Backend submodules (each rebased onto latest upstream, +1 commit) also carry HBF
+support: `astra-sim` models HBF as a first-class memory tier, `chakra` adds
+`--weight-prefetch-depth` + `HBF_MEMORY`, and `analytical` adds the `HBF_MEMORY`
+location type.
+
+> **Removed features**: the experimental HBF `bandwidth` source
+> (`BandwidthHBFPerformanceSource`), MoE hot/cold expert residency
+> (`moe_hot_expert_frac`), and the KV spill-vs-recompute cost model
+> (`serving/core/kv_policy.py`) were dropped and are **not** part of this fork's
+> current difference from upstream.
+
+## Minimum setup (any Python 3.11 environment)
+
+The repo does not mandate a specific environment manager (mise / conda / venv).
 
 ```bash
-git clone --recurse-submodules https://github.com/casys-kaist/LLMServingSim.git
-cd LLMServingSim
-./scripts/docker-sim.sh           # launch the simulator container
-./scripts/compile.sh              # build ASTRA-Sim + Chakra
-./serving/run.sh                  # run the example simulations
+# 1. Python deps (matplotlib is only needed for `plot`)
+pip install pyyaml pytest numpy pandas pyinstrument rich msgspec protobuf==7.35.1
+pip install matplotlib   # only for plot
+
+# 2. Submodules (recursive — covers this submodule's own nested submodules)
+git submodule update --init --recursive
+
+# 3. Compile ASTRA-Sim (first use)
+cd astra-sim && bash build/astra_analytical/build.sh
+
+# 4. Make the repo's chakra converter importable (not the pip-installed copy)
+export PYTHONPATH="$PWD/astra-sim/extern/graph_frontend"
 ```
 
-For installation details, container choices, configuration layout, CLI
-flags, and the full set of example workloads, see the
-[documentation](https://llmservingsim.ai/docs/getting-started/overview).
+`serving` shells out to `python -m chakra.src.converter.converter`; the `graph_frontend`
+parent dir (containing `chakra/`) must be on `PYTHONPATH` so the repo's converter (with
+`--weight-prefetch-depth` and the metadata-path fix) is used rather than a pip copy.
 
-## Publications
+## Run a small simulation
 
-**ISPASS 2026**  
-*LLMServingSim 2.0: A Unified Simulator for Heterogeneous and Disaggregated LLM Serving Infrastructure*  
-Jaehong Cho<sup>\*</sup>, Hyunmin Choi<sup>\*</sup>, Guseul Heo, Jongse Park (KAIST) [[Paper]](https://doi.org/10.1109/ISPASS69572.2026.00012)  
-<sup>\*</sup>Equal contribution  
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18879965.svg)](https://doi.org/10.5281/zenodo.18879965)
-
-**CAL 2025**  
-*LLMServingSim2.0: A Unified Simulator for Heterogeneous Hardware and Serving Techniques in LLM Infrastructure*  
-Jaehong Cho, Hyunmin Choi, Jongse Park (KAIST)  [[Paper]](https://doi.org/10.1109/LCA.2025.3628325)
-
-**IISWC 2024**  
-*LLMServingSim: A HW/SW Co-Simulation Infrastructure for LLM Inference Serving at Scale*  
-Jaehong Cho, Minsu Kim, Hyunmin Choi, Guseul Heo, Jongse Park (KAIST)  [[Paper]](https://doi.org/10.1109/IISWC63097.2024.00012)  
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.12803583.svg)](https://doi.org/10.5281/zenodo.12803583)
-
-## Citation
-
-If you use LLMServingSim in your research, please cite:
-
-```bibtex
-@INPROCEEDINGS{11527300,
-    author={Cho, Jaehong and Choi, Hyunmin and Heo, Guseul and Park, Jongse},
-    booktitle={2026 IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS)}, 
-    title={{LLMServingSim 2.0: A Unified Simulator for Heterogeneous and Disaggregated LLM Serving Infrastructure}}, 
-    year={2026},
-    pages={1-14},
-    doi={10.1109/ISPASS69572.2026.00012}
-}
-
-@ARTICLE{11224567,
-    author={Cho, Jaehong and Choi, Hyunmin and Park, Jongse},
-    journal={IEEE Computer Architecture Letters},
-    title={{LLMServingSim2.0: A Unified Simulator for Heterogeneous Hardware and Serving
-            Techniques in LLM Infrastructure}},
-    year={2025},
-    volume={24},
-    number={02},
-    pages={361-364},
-    doi={10.1109/LCA.2025.3628325},
-    ISSN={1556-6064},
-    publisher={IEEE Computer Society},
-    address={Los Alamitos, CA, USA},
-    month=jul
-}
-
-@INPROCEEDINGS{10763697,
-    author={Cho, Jaehong and Kim, Minsu and Choi, Hyunmin and Heo, Guseul and Park, Jongse},
-    booktitle={2024 IEEE International Symposium on Workload Characterization (IISWC)},
-    title={{LLMServingSim: A HW/SW Co-Simulation Infrastructure for LLM Inference Serving
-            at Scale}},
-    year={2024},
-    pages={15-29},
-    doi={10.1109/IISWC63097.2024.00012}
-}
+```bash
+bash serving/run.sh   # single-instance example, or:
+python -m serving \
+  --cluster-config configs/cluster/single_node_single_instance.json \
+  --dtype float16 --block-size 16 \
+  --dataset workloads/example_trace.jsonl --output outputs/example_single_run.csv \
+  --num-req 10
 ```
+
+HBF configuration lives in `configs/cluster/hbf_*.json`; see
+`docs/docs/examples/memory-tiers/hbf-static-weights.md`.
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+## Regenerate Chakra proto bindings (only if needed)
+
+Not required to run experiments. The vendored `protobuf==7.35.1` matches the checked-in
+gencode; do not install 6.x.
