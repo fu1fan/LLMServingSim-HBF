@@ -27,6 +27,12 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.hbf_performance import apply_hbf_latency_scale_override
+from serving.core.expert_routing_profile import validate_expert_routing_options
+from serving.core.hbf_summary import (
+    build_hbf_runtime_summary,
+    write_json_output,
+)
 import sys as flush
 
 from pyinstrument import Profiler
@@ -305,8 +311,8 @@ def main():
                         'matching vLLM v1 behavior (default: enabled). Use --no-enable-chunked-prefill to disable')
     parser.add_argument('--enable-prefix-sharing', action='store_true', default=False,
                         help='enable second-tier prefix cache pooling across instances within a node')
-    parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL'], default='None',
-                        help='storage medium for the second-tier prefix cache pool: None (NPU only), CPU, or CXL')
+    parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL', 'HBF'], default='None',
+                        help='storage medium for the second-tier prefix cache pool: None (NPU only), CPU, CXL, or HBF')
     parser.add_argument('--enable-local-offloading', action='store_true', default=False,
                         help='enable weight offloading to local (NPU) memory. '
                         'Recommended to disable unless weight memory access is not counted in profiling')
@@ -371,6 +377,14 @@ def main():
                         'halves KV cache memory. Override per instance with "kv_cache_dtype"')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--expert-routing-profile', type=str, default=None,
+                        help='path to a calibrated expert-routing profile for --expert-routing-policy=CUSTOM')
+    parser.add_argument('--expert-routing-seed', type=int, default=42,
+                        help='seed for stochastic expert routing (used by RAND and CUSTOM)')
+    parser.add_argument('--hbf-latency-scale', type=float, default=None,
+                        help='override the latency_scale of every hbf_mem instance whose performance.source is "scale"')
+    parser.add_argument('--hbf-summary-output', type=str, default=None,
+                        help='path for HBF runtime summary JSON (metadata for reproducibility)')
 
     args = parser.parse_args()
     
@@ -378,6 +392,20 @@ def main():
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+
+    validate_expert_routing_options(
+        args.expert_routing_policy,
+        args.expert_routing_profile,
+        args.enable_block_copy,
+    )
+    if args.expert_routing_profile is not None:
+        args.expert_routing_profile = resolve_user_input_path(
+            args.expert_routing_profile
+        )
+    if args.hbf_summary_output is not None:
+        args.hbf_summary_output = _resolve_output_file(
+            args.hbf_summary_output, args.run_id
+        )
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -406,6 +434,7 @@ def main():
     cluster = build_cluster_config(
         astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
         inputs_root=run_paths.inputs_root)
+    apply_hbf_latency_scale_override(cluster["instances"], args.hbf_latency_scale)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
@@ -455,6 +484,8 @@ def main():
         pool_device = Device.CPU
     elif prefix_storage == "CXL":
         pool_device = Device.CXL
+    elif prefix_storage == "HBF":
+        pool_device = Device.HBF
 
     if any_prefix_caching and enable_prefix_sharing and prefix_storage != 'None':
         num_prefix_pool = num_nodes
@@ -540,6 +571,8 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             npu_memory_utilization=inst_cfg["npu_memory_utilization"],
             reserve_full_isl=inst_cfg["reserve_full_isl"],
+            placement=placement[instance_id],
+            hbf_mem=instance.get("hbf_mem"),
         ))
 
     # The derived KV capacity, not the utilization fraction, is what decides
@@ -800,6 +833,7 @@ def main():
                         batch.workload_name = dp_workload_name
                         inst = instances[inst_id]
                         inst_cfg = instance_runtime_configs[inst_id]
+                        routing_key = f"dp:{dg}:batch:{first_batch.batch_id}"
                         trace_data = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
                                        inst["local_ep"], inst["ep_total"], inst["pd_type"],
                                        nid, inst_id,
@@ -811,9 +845,14 @@ def main():
                                        inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                        dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                       ep_rank_offset=inst.get("ep_rank_offset", 0),
+                                       routing_key=routing_key,
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
-                                       inputs_root=run_paths.inputs_root)
+                                       inputs_root=run_paths.inputs_root,
+                                       hbf_mem=inst.get("hbf_mem"),
+                                       expert_routing_profile=args.expert_routing_profile,
+                                       expert_routing_seed=args.expert_routing_seed)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -888,6 +927,7 @@ def main():
                             batch.workload_name = dp_workload_name
                             inst = instances[inst_id]
                             inst_cfg = instance_runtime_configs[inst_id]
+                            routing_key = f"dp:{dg}:batch:{first_batch.batch_id}"
                             trace_data = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
                                            inst["local_ep"], inst["ep_total"], inst["pd_type"],
                                            nid, inst_id,
@@ -899,9 +939,14 @@ def main():
                                            inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                            dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                           ep_rank_offset=inst.get("ep_rank_offset", 0),
+                                           routing_key=routing_key,
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
-                                           inputs_root=run_paths.inputs_root)
+                                           inputs_root=run_paths.inputs_root,
+                                           hbf_mem=inst.get("hbf_mem"),
+                                           expert_routing_profile=args.expert_routing_profile,
+                                           expert_routing_seed=args.expert_routing_seed)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -943,8 +988,13 @@ def main():
                                    inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
+                                   ep_rank_offset=instance.get("ep_rank_offset", 0),
+                                   routing_key=None,
                                    enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                                   inputs_root=run_paths.inputs_root,
+                                   hbf_mem=instance.get("hbf_mem"),
+                                   expert_routing_profile=args.expert_routing_profile,
+                                   expert_routing_seed=args.expert_routing_seed)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1256,6 +1306,11 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+
+    if args.hbf_summary_output is not None:
+        summary = build_hbf_runtime_summary(
+            instances, schedulers, total_npu, run_paths.run_id)
+        write_json_output(args.hbf_summary_output, summary)
 
     # --save-trace-text writes the text into the run directory, so keeping it
     # is implied: producing the text and then deleting it would be pointless.

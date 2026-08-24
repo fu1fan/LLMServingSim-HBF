@@ -1,5 +1,7 @@
+import hashlib
 import random
 from dataclasses import dataclass
+import numpy as np
 from .logger import get_logger
 
 
@@ -9,6 +11,18 @@ class RoutingResult:
     local_tokens: list     # [rank] -> token count routed to this rank
     activated_experts: list # [rank] -> number of distinct experts activated on this rank
     source_tokens: list    # [rank] -> token count originating from this rank before dispatch
+
+
+def local_ep_rank_indices(local_ep, ep_total, ep_rank_offset):
+    local_ep = max(int(local_ep), 1)
+    ep_total = max(int(ep_total), 1)
+    ep_rank_offset = int(ep_rank_offset)
+    if ep_rank_offset < 0 or ep_rank_offset + local_ep > ep_total:
+        raise ValueError(
+            f"Invalid EP rank slice: offset={ep_rank_offset}, "
+            f"local_ep={local_ep}, ep_total={ep_total}"
+        )
+    return range(ep_rank_offset, ep_rank_offset + local_ep)
 
 
 class GateRouter:
@@ -46,6 +60,7 @@ class GateRouter:
         routing_policy="BALANCED",
         seed=42,
         block_copy=True,
+        custom_profile=None,
     ):
         self.instance_id = instance_id
         self.E = int(num_local_experts)
@@ -54,6 +69,21 @@ class GateRouter:
         self.seed = seed
         self.rnd = random.Random(seed) if seed is not None else random
         self.block_copy = bool(block_copy)
+        self.custom_profile = custom_profile
+
+        if self.routing_policy == "CUSTOM":
+            if custom_profile is None:
+                raise ValueError(
+                    "CUSTOM expert routing requires a calibrated routing profile"
+                )
+            if self.block_copy:
+                raise ValueError(
+                    "CUSTOM expert routing requires block_copy=False"
+                )
+        elif custom_profile is not None:
+            raise ValueError(
+                "A custom routing profile may only be used with CUSTOM routing"
+            )
 
         if self.routing_policy == "RR":
             self.routing_fn = self._rr_routing
@@ -87,10 +117,119 @@ class GateRouter:
         return self.rnd.sample(range(E), k)
 
     def _custom_gate_function(self, token_idx, E, k):
-        raise NotImplementedError("Implement custom gate function.")
+        selected = self._sample_custom_experts(
+            layer_num=0,
+            routing_key=f"flat:{token_idx}",
+            total_len=1,
+        )
+        return selected[0].tolist()
+
+    @staticmethod
+    def _stable_seed(*parts):
+        payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
+        return int.from_bytes(
+            hashlib.sha256(payload).digest()[:8],
+            byteorder="big",
+            signed=False,
+        )
+
+    def _custom_layer_weights(self, layer_num):
+        profile = self.custom_profile
+        base_weights = np.sort(
+            np.asarray(profile.selection_weights, dtype=np.float64)
+        )[::-1]
+        permutation_seed = self._stable_seed(
+            profile.sha256,
+            self.seed,
+            "layer",
+            int(layer_num),
+        )
+        rng = np.random.Generator(np.random.PCG64(permutation_seed))
+        expert_ids = rng.permutation(self.E)
+        weights = np.empty(self.E, dtype=np.float64)
+        weights[expert_ids] = base_weights
+        return weights
+
+    def _sample_custom_experts(
+        self,
+        layer_num,
+        routing_key,
+        total_len,
+        chunk_size=4096,
+    ):
+        total_len = int(total_len)
+        if total_len < 0:
+            raise ValueError("total_len must be non-negative")
+        if total_len == 0:
+            return np.empty((0, self.k), dtype=np.int64)
+
+        weights = self._custom_layer_weights(layer_num)
+        log_weights = np.log(weights)
+        batch_seed = self._stable_seed(
+            self.custom_profile.sha256,
+            self.seed,
+            "batch",
+            int(layer_num),
+            routing_key,
+            total_len,
+        )
+        rng = np.random.Generator(np.random.PCG64(batch_seed))
+        selected_chunks = []
+        for start in range(0, total_len, int(chunk_size)):
+            rows = min(int(chunk_size), total_len - start)
+            scores = (
+                log_weights[None, :]
+                + rng.gumbel(size=(rows, self.E))
+            )
+            selected = np.argpartition(
+                scores, self.E - self.k, axis=1
+            )[:, -self.k:]
+            selected_chunks.append(selected.astype(np.int64, copy=False))
+        return np.concatenate(selected_chunks, axis=0)
+
+    def _custom_route_ep(
+        self,
+        layer_num,
+        routing_key,
+        total_len,
+        ep_size,
+    ):
+        selected = self._sample_custom_experts(
+            layer_num,
+            routing_key,
+            total_len,
+        )
+        local_tokens = [0] * ep_size
+        activated_counts = [0] * ep_size
+        if selected.size == 0:
+            return local_tokens, activated_counts
+
+        owners = np.minimum(
+            selected * ep_size // self.E,
+            ep_size - 1,
+        )
+        for rank in range(ep_size):
+            rank_hits = owners == rank
+            local_tokens[rank] = int(np.count_nonzero(np.any(rank_hits, axis=1)))
+            activated_counts[rank] = int(
+                np.unique(selected[rank_hits]).size
+            )
+        return local_tokens, activated_counts
 
     def route(self, layer_num, batch_id, total_len):
         """Returns flat token counts per expert (used when EP=1)."""
+        if self.routing_policy == "CUSTOM":
+            selected = self._sample_custom_experts(
+                layer_num,
+                batch_id,
+                total_len,
+            )
+            counts = np.bincount(
+                selected.reshape(-1),
+                minlength=self.E,
+            ).astype(int).tolist()
+            return counts
+
         counts = [0] * self.E
         for t in range(int(total_len)):
             exps = self.routing_fn(t, self.E, self.k)
@@ -104,7 +243,14 @@ class GateRouter:
         )
         return counts
 
-    def route_ep(self, layer_num, batch_id, total_len, ep_size):
+    def route_ep(
+        self,
+        layer_num,
+        batch_id,
+        total_len,
+        ep_size,
+        routing_key=None,
+    ):
         """EP-aware routing: returns per-rank token counts and activated experts.
 
         Tokens are distributed evenly across EP ranks before dispatch
@@ -129,6 +275,13 @@ class GateRouter:
         if self.routing_policy == "BALANCED":
             local_tokens, activated_counts = self._balanced_route_ep(
                 total_len, ep_size, source_tokens,
+            )
+        elif self.routing_policy == "CUSTOM":
+            local_tokens, activated_counts = self._custom_route_ep(
+                layer_num,
+                routing_key if routing_key is not None else batch_id,
+                total_len,
+                ep_size,
             )
         else:
             local_tokens = [0] * ep_size

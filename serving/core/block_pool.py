@@ -40,6 +40,7 @@ class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
+    HBF = 4
 
 
 # Seed of the chained block-hash. vLLM draws this from ``os.urandom`` unless
