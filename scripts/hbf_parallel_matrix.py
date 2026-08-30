@@ -508,7 +508,6 @@ def build_command(repo_root, manifest, spec, run_dir, python):
         "--log-level",
         "INFO",
         "--no-enable-prefix-caching",
-        "--cleanup-inputs",
     ]
     if spec.memory_tier == "hbf":
         command.extend(
