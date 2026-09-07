@@ -359,15 +359,14 @@ def _instance_config(manifest, spec):
 
 
 def _pack_nodes(instances):
+    """Pack logical host domains; physical PP placement is tracked separately."""
     nodes = []
     current = []
     used = 0
     for instance in instances:
         devices = int(instance["num_npus"])
-        if devices > 8:
-            raise ValueError(
-                "A single model-parallel group may not exceed one 8-GPU node"
-            )
+        if int(instance["tp_size"]) > 8:
+            raise ValueError("A TP stage may not exceed one 8-GPU node")
         if current and used + devices > 8:
             nodes.append(current)
             current = []
@@ -390,39 +389,62 @@ def _pack_nodes(instances):
     ]
 
 
+def _physical_stage_layout(instances):
+    """Map stages to physical nodes without splitting a TP stage.
+
+    The serving host schema remains logical: a spanning instance belongs to
+    one host-memory domain. Physical layout here drives network parameters,
+    not per-node CPU memory, power, or offload accounting.
+    """
+    layouts = []
+    node, used = 0, 0
+    for instance in instances:
+        tp, pp = int(instance["tp_size"]), int(instance["pp_size"])
+        if tp < 1 or tp > 8:
+            raise ValueError("TP stage must fit in an 8-GPU node")
+        need = tp * pp
+        if used and (need > 8 or used + need > 8):
+            node, used = node + 1, 0
+        stages = []
+        for _ in range(pp):
+            if used + tp > 8:
+                node, used = node + 1, 0
+            stages.append(node)
+            used += tp
+        layouts.append(stages)
+        if need > 8:
+            node, used = node + 1, 0
+    return layouts
+
+
 def _network_values(manifest, spec, num_nodes):
+    """Match current config_builder dimensions, with conservative PP links.
+
+    ASTRA's analytical network has one bandwidth per dimension. If PP mixes
+    intra/inter-node boundaries, use the inter-node setting for its whole
+    dimension and expose that approximation in build_cluster_config.
+    """
     scenario = manifest["network_scenarios"][spec.network_scenario]
     topology = spec.topology
-    dp_group = topology.get("dp_group_size")
+    tp, pp = int(topology["tp"]), int(topology["pp"])
+    dp = topology.get("dp_group_size")
     replicas = int(topology.get("replicas", 1))
-    tp = int(topology["tp"])
-    pp = int(topology["pp"])
-    if dp_group is not None:
-        num_dims = 2
+    pp_cross = tp * pp > 8
+    if dp is not None:
+        dims = [tp] + ([pp] if pp > 1 else []) + [int(dp)]
+        inter = [False] + ([pp_cross] if pp > 1 else []) + [num_nodes > 1]
+    elif tp == 1:
+        dims = [pp, replicas]
+        inter = [pp_cross, False]
     else:
-        second_dim = replicas if tp == 1 else replicas * pp
-        num_dims = 2 if second_dim > 1 else 1
-    if num_dims == 1:
-        return (
-            scenario["intra_bw_gb_s"],
-            scenario["intra_latency_ns"],
-        )
-
-    second_is_cross_node_ep = dp_group is not None and num_nodes > 1
-    second_bw = (
-        scenario["inter_bw_gb_s"]
-        if second_is_cross_node_ep
-        else scenario["intra_bw_gb_s"]
-    )
-    second_latency = (
-        scenario["inter_latency_ns"]
-        if second_is_cross_node_ep
-        else scenario["intra_latency_ns"]
-    )
-    return (
-        [scenario["intra_bw_gb_s"], second_bw],
-        [scenario["intra_latency_ns"], second_latency],
-    )
+        dims = [tp, pp * replicas]
+        inter = [False, pp_cross]
+    while len(dims) > 1 and dims[-1] == 1:
+        dims.pop()
+        inter.pop()
+    bw = [scenario["inter_bw_gb_s" if x else "intra_bw_gb_s"] for x in inter]
+    latency = [scenario["inter_latency_ns" if x else "intra_latency_ns"] for x in inter]
+    return (bw[0], latency[0]) if len(dims) == 1 else (bw, latency)
 
 
 def build_cluster_config(manifest, spec):
@@ -435,10 +457,19 @@ def build_cluster_config(manifest, spec):
         for _ in range(instance_count)
     ]
     nodes = _pack_nodes(instances)
-    link_bw, link_latency = _network_values(
-        manifest, spec, len(nodes)
-    )
+    stage_nodes = _physical_stage_layout(instances)
+    physical_count = max(max(row) for row in stage_nodes) + 1
+    link_bw, link_latency = _network_values(manifest, spec, physical_count)
+    cross_pp = any(len(set(row)) > 1 for row in stage_nodes)
     return {
+        "physical_layout": {
+            "gpus_per_node": 8,
+            "num_nodes": physical_count,
+            "instance_stage_nodes": stage_nodes,
+            "cross_node_pp": cross_pp,
+            "pp_link_model": "inter-dimension-conservative" if cross_pp else "intra",
+            "host_memory_model": "logical-instance-host" if cross_pp else "physical-node",
+        },
         "num_nodes": len(nodes),
         "link_bw": link_bw,
         "link_latency": link_latency,

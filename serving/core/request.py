@@ -36,6 +36,7 @@ class Request:
         self.status = RequestStatus.WAITING
         self.end_time = -1
         self.latency = -1
+        self.first_scheduled_time = None
         self.queuing_delay = -1
         self.ttft = -1
         self.tpot = -1
@@ -88,7 +89,9 @@ class Request:
         self.recent_end = current
 
     def set_que_delay(self, current):
-        self.queuing_delay = current - self.arrival
+        if self.first_scheduled_time is None:
+            self.first_scheduled_time = current
+            self.queuing_delay = current - self.arrival
     
     def set_ttft(self, current):
         self.ttft = current - self.arrival

@@ -6,6 +6,8 @@ spawns the ASTRA-Sim subprocess, and runs the iteration loop:
 -> scheduler.add_done`` until every request completes.
 """
 
+from serving.core.cross_node_pp import validate_cross_node_pp_scope
+
 import os
 import subprocess
 import argparse
@@ -425,6 +427,12 @@ def main():
     log_interval=args.log_interval
     network_backend = args.network_backend
     raw_cluster_config = _load_cluster_config_for_overrides(args.cluster_config)
+    validate_cross_node_pp_scope(
+        raw_cluster_config, prefix_storage=args.prefix_storage,
+        prefix_sharing=args.enable_prefix_sharing,
+        local_offloading=args.enable_local_offloading,
+        attn_offloading=args.enable_attn_offloading,
+    )
     raw_instances = list(_iter_raw_instances(raw_cluster_config))
     build_enable_local_offloading = args.enable_local_offloading or any(
         inst.get("enable_local_offloading", False) for inst in raw_instances)

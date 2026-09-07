@@ -550,7 +550,7 @@ class Scheduler:
             if not is_append:
                 writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
                                 'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
+                                'queuing_delay', 'TTFT', 'TPOT', 'ITL', 'first_scheduled_time'])
             
             # Write each request's information
             for req in self.done:
@@ -566,7 +566,8 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl
+                    req.itl,
+                    req.first_scheduled_time,
                 ])
 
 
